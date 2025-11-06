@@ -1,20 +1,42 @@
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
+import subprocess
+import os
+import sys
 
-def demonstriere_schluessel_generierung():
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048
-    )
+KEY_FILE_NAME = "id_rsa_auto_gen" 
 
-    public_key = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.OpenSSH,
-        format=serialization.PublicFormat.OpenSSH
-    )
+def generate_ssh_key_safe():
+    ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+    os.makedirs(ssh_dir, exist_ok=True)
+    output_path = os.path.join(ssh_dir, KEY_FILE_NAME)
+    command = [
+        "ssh-keygen", 
+        "-t", "rsa", 
+        "-b", "4096", 
+        "-f", output_path,
+        "-q"
+    ]
 
-    print("✅ Öffentlicher Schlüssel (SSH-Format-Ausschnitt):\n")
-    print(public_key.decode().split()[0] + "...") 
-    print("\nDies demonstriert, dass Python kryptographische Primitive verarbeiten kann.")
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True, stdin=sys.stdin)
+        
+        public_key_path = f"{output_path}.pub"
+        with open(public_key_path, 'r') as f:
+            public_key_content = f.read().strip()
+            
+        print("\nSchlüsselpaar erfolgreich generiert.")
+        print("Öffentlicher Schlüssel (Inhalt der .pub-Datei):\n")
+        print(public_key_content)
+        
+        print("\n💾 Speicherort:")
+        print(f"   Privater Schlüssel (NICHT TEILEN): {output_path}")
+        print(f"   Öffentlicher Schlüssel: {public_key_path}")
+        
+    except FileNotFoundError:
+        print("\nERROR: Der Befehl 'ssh-keygen' wurde nicht gefunden. Stellen Sie sicher, dass OpenSSH installiert ist.")
+    except subprocess.CalledProcessError as e:
+        print(f"\nERROR beim Ausführen von ssh-keygen: {e.stderr.strip()}")
+    except Exception as e:
+        print(f"\nERROR: Ein unerwarteter Fehler ist aufgetreten: {e}")
 
 if __name__ == "__main__":
-    demonstriere_schluessel_generierung()
+    generate_ssh_key_safe()
