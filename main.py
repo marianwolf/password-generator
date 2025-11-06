@@ -43,7 +43,7 @@ def passwort_generator():
     passwort = "".join(passwort_liste)
 
     print("\n" + "="*50)
-    print(f"Dein generiertes {laenge}-stelliges Passwort:")
+    print(f"Dein {laenge}-stelliges Passwort:")
     print(f"{passwort}")
     print("="*50)
 
