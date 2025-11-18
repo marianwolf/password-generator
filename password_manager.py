@@ -7,13 +7,14 @@ import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from typing import Tuple, List, Union
 
 DB_FILE = 'password_manager.db' 
 
 # --- KRYPTOGRAFIE ---
-def derive_key_argon2(master_password: str, salt: bytes) -> bytes:
+def derive_key_pbkdf2(master_password: str, salt: bytes) -> bytes:
+    """PBKDF2-HMAC (SHA256, 200k Iterationen) zur Schlüsselableitung."""
     pw_bytes = master_password.encode('utf-8')
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
@@ -25,7 +26,7 @@ def derive_key_argon2(master_password: str, salt: bytes) -> bytes:
     return kdf.derive(pw_bytes)
 
 def derive_key(master_password: str, salt: bytes) -> bytes:
-    return derive_key_argon2(master_password, salt)
+    return derive_key_pbkdf2(master_password, salt)
 
 # AES-256 GCM Verschlüsselung
 def encrypt_password(key: bytes, plaintext: str) -> str:
@@ -54,7 +55,7 @@ def decrypt_password(key: bytes, ciphertext: str) -> str:
         ciphertext_bytes = base64.b64decode(cipher_b64)
         
         if len(iv) != 12:
-            return "FEHLER: Ungültige IV-Länge"
+            return "FEHLER: Ungültige IV-Länge (muss 12 sein)"
 
         cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag), backend=default_backend())
         decryptor = cipher.decryptor()
@@ -65,31 +66,33 @@ def decrypt_password(key: bytes, ciphertext: str) -> str:
         return plaintext_bytes.decode('utf-8')
         
     except Exception as e:
-        return f"❌ ENTSCHLÜSSELUNGSFEHLER: {e}"
+        return f"❌ ENTSCHLÜSSELUNGSFEHLER (Ungültiges Passwort/Integrität verletzt): {e.__class__.__name__}"
+
 
 # --- DATENBANK ---
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            hashed_password BLOB NOT NULL,
-            argon2_salt BLOB NOT NULL -- Salt für Argon2-Schlüsselableitung
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            service TEXT NOT NULL,
-            encrypted_password TEXT NOT NULL,
-            salt BLOB, 
-            FOREIGN KEY(user_id) REFERENCES users(username)
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    hashed_password BLOB NOT NULL,
+                    argon2_salt BLOB NOT NULL -- Salt für PBKDF2 (ehemals Argon2 genannt)
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    service TEXT NOT NULL,
+                    encrypted_password TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(username)
+                )
+            ''')
+            conn.commit()
+    except Exception as e:
+        print(f"Fehler beim Initialisieren der Datenbank: {e}")
 
 # --- HELFER-FUNKTIONEN ---
 def check_password(password: str, hashed_password: bytes) -> bool:
@@ -104,15 +107,14 @@ def hash_password(password: str) -> bytes:
 # --- CRUD-Funktionen für User-Master-Passwort ---
 def create_user(username: str, password: str) -> bool:
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        hashed_pw = hash_password(password)
-        argon2_salt = os.urandom(16) 
-        c.execute("INSERT INTO users (username, hashed_password, argon2_salt) VALUES (?, ?, ?)", 
-                  (username, hashed_pw, argon2_salt))
-        conn.commit()
-        conn.close()
-        return True
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            hashed_pw = hash_password(password)
+            argon2_salt = os.urandom(16) 
+            c.execute("INSERT INTO users (username, hashed_password, argon2_salt) VALUES (?, ?, ?)", 
+                      (username, hashed_pw, argon2_salt))
+            conn.commit()
+            return True
     except sqlite3.IntegrityError:
         print("❌ Fehler: Benutzername existiert bereits.")
         return False
@@ -120,86 +122,82 @@ def create_user(username: str, password: str) -> bool:
         print(f"Fehler bei Benutzererstellung: {e}")
         return False
         
-def authenticate_user(username: str, password: str) -> tuple[bool, bytes | None]:
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT hashed_password, argon2_salt FROM users WHERE username = ?", (username,))
-    result = c.fetchone()
-    conn.close()
+def authenticate_user(username: str, password: str) -> Tuple[bool, Union[bytes, None]]:
+    """Authentifiziert einen Benutzer und gibt das KDF-Salt bei Erfolg zurück."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT hashed_password, argon2_salt FROM users WHERE username = ?", (username,))
+            result = c.fetchone()
 
-    if result:
-        hashed_pw_from_db, argon2_salt = result
-        if check_password(password, hashed_pw_from_db):
-            return True, argon2_salt
+        if result:
+            hashed_pw_from_db, argon2_salt = result
+            if check_password(password, hashed_pw_from_db):
+                return True, argon2_salt
+            else:
+                return False, None
         else:
             return False, None
-    else:
+    except Exception as e:
+        print(f"Fehler bei der Authentifizierung: {e}")
         return False, None
 
 # --- CRUD-Funktionen für Accounts ---
 def add_account(user_id: str, service: str, password_to_store: str, master_password: str, argon2_salt: bytes) -> bool:
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        dummy_salt = b'\x00' * 16 
-
-        encryption_key = derive_key(master_password, argon2_salt)
-        encrypted_password = encrypt_password(encryption_key, password_to_store)
-        
-        c.execute("INSERT INTO accounts (user_id, service, encrypted_password, salt) VALUES (?, ?, ?, ?)", 
-                  (user_id, service, encrypted_password, dummy_salt))
-        
-        conn.commit()
-        conn.close()
-        return True
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            
+            encryption_key = derive_key(master_password, argon2_salt)
+            encrypted_password = encrypt_password(encryption_key, password_to_store)
+            
+            c.execute("INSERT INTO accounts (user_id, service, encrypted_password) VALUES (?, ?, ?)", 
+                      (user_id, service, encrypted_password))
+            
+            conn.commit()
+            return True
     except Exception as e:
         print(f"Fehler beim Hinzufügen: {e}")
         return False
 
-def get_accounts(user_id: str) -> list:
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, service, encrypted_password, salt FROM accounts WHERE user_id = ?", (user_id,))
-    results = c.fetchall()
-    conn.close()
-    return results
-
-def update_account_password(account_id: int, new_password: str, master_password: str, argon2_salt: bytes) -> bool:
+def get_accounts(user_id: str) -> List[Tuple[int, str, str]]:
+    """Ruft alle Dienst-Einträge eines Benutzers ab."""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        c.execute("SELECT id FROM accounts WHERE id = ?", (account_id,))
-        if not c.fetchone():
-            conn.close()
-            return False
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, service, encrypted_password FROM accounts WHERE user_id = ?", (user_id,))
+            results = c.fetchall()
+            return results
+    except Exception as e:
+        print(f"Fehler beim Abrufen der Konten: {e}")
+        return []
+
+def update_account_password(account_id: int, new_password: str, master_password: str, argon2_salt: bytes, user_id: str) -> bool:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+                
+            encryption_key = derive_key(master_password, argon2_salt)
+            encrypted_password = encrypt_password(encryption_key, new_password)
             
-        encryption_key = derive_key(master_password, argon2_salt)
-        encrypted_password = encrypt_password(encryption_key, new_password)
-        c.execute("UPDATE accounts SET encrypted_password = ? WHERE id = ?", 
-                  (encrypted_password, account_id))
-        
-        conn.commit()
-        was_updated = c.rowcount > 0
-        conn.close()
-        return was_updated
+            c.execute("UPDATE accounts SET encrypted_password = ? WHERE id = ? AND user_id = ?", 
+                      (encrypted_password, account_id, user_id))
+            
+            conn.commit()
+            return c.rowcount > 0
     except Exception as e:
         print(f"Update Fehler: {e}")
         return False
 
-# --- NEU: Fehlende Funktion hinzugefügt ---
 def delete_account(account_id: int) -> bool:
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        c.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        
-        conn.commit()
-        was_deleted = c.rowcount > 0
-        conn.close()
-        return was_deleted
+        with sqlite3.connect(DB_FILE) as conn:
+            c = conn.cursor()
+            
+            c.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+            
+            conn.commit()
+            return c.rowcount > 0
     except Exception as e:
         print(f"Lösch-Fehler: {e}")
         return False
@@ -208,7 +206,7 @@ def handle_login():
     print("\n--- Anmelden / Registrieren ---")
     username = input("Benutzername: ").strip()
     try:
-        password = getpass.getpass("Passwort: ").strip()
+        password = getpass.getpass("Passwort: ").strip() 
     except ImportError:
         password = input("Passwort: ").strip()
         
@@ -216,27 +214,27 @@ def handle_login():
         print("Eingabe darf nicht leer sein.")
         return
 
-    authenticated, argon2_salt = authenticate_user(username, password)
+    authenticated, kdf_salt = authenticate_user(username, password)
     
     if authenticated:
         print(f"\n🎉 Anmeldung erfolgreich! Willkommen, {username}.")
-        if argon2_salt is not None:
-            user_menu(username, password, argon2_salt) 
+        if kdf_salt is not None:
+            user_menu(username, password, kdf_salt) 
         else:
              print("❌ Fehler: Konnte Salt nicht abrufen. Bitte wenden Sie sich an den Support.")
     else:
         print("Anmeldung fehlgeschlagen. Versuche, neuen Benutzer zu registrieren...")
         if create_user(username, password):
-             _, argon2_salt = authenticate_user(username, password)
+             _, kdf_salt = authenticate_user(username, password) 
              print(f"🎉 Registrierung erfolgreich! Willkommen, {username}.")
-             if argon2_salt is not None:
-                user_menu(username, password, argon2_salt)
+             if kdf_salt is not None:
+                user_menu(username, password, kdf_salt)
              else:
                 print("❌ Fehler: Konnte Salt nach Registrierung nicht abrufen.")
         else:
              print("❌ Registrierung/Anmeldung fehlgeschlagen.")
 
-def user_menu(username: str, master_password: str, argon2_salt: bytes):
+def user_menu(username: str, master_password: str, kdf_salt: bytes):
     while True:
         print("\n" + "~"*40)
         print(f"👤 Verwaltung von {username}")
@@ -251,13 +249,13 @@ def user_menu(username: str, master_password: str, argon2_salt: bytes):
         choice = input("Wahl (1-5): ").strip()
         
         if choice == '1':
-            handle_add_password(username, master_password, argon2_salt)
+            handle_add_password(username, master_password, kdf_salt)
         elif choice == '2':
-            handle_view_passwords(username, master_password, argon2_salt)
+            handle_view_passwords(username, master_password, kdf_salt)
         elif choice == '3':
-            handle_update_password(username, master_password, argon2_salt)
+            handle_update_password(username, master_password, kdf_salt)
         elif choice == '4':
-            handle_delete_password(username, master_password, argon2_salt) 
+            handle_delete_password(username, master_password, kdf_salt) 
         elif choice == '5':
             print("Erfolgreich abgemeldet.")
             break
@@ -267,7 +265,10 @@ def user_menu(username: str, master_password: str, argon2_salt: bytes):
 def handle_add_password(username: str, master_password: str, argon2_salt: bytes):
     print("\n--- Dienst-Passwort hinzufügen ---")
     service = input("Dienstname: ").strip()
-    password_to_store = input("Passwort für diesen Dienst: ").strip() 
+    try:
+        password_to_store = getpass.getpass("Passwort für diesen Dienst: ").strip()
+    except ImportError:
+         password_to_store = input("Passwort für diesen Dienst: ").strip() 
     
     if service and password_to_store:
         if add_account(username, service, password_to_store, master_password, argon2_salt):
@@ -292,7 +293,7 @@ def handle_view_passwords(username: str, master_password: str, argon2_salt: byte
 
     encryption_key = derive_key(master_password, argon2_salt)
 
-    for acc_id, service, encrypted_password, salt in accounts: 
+    for acc_id, service, encrypted_password in accounts: 
         decrypted_password = decrypt_password(encryption_key, encrypted_password)
         print(f"{acc_id:<3} | {service:<20} | {decrypted_password:<30}")
     print("-" * 55)
@@ -306,16 +307,20 @@ def handle_update_password(username: str, master_password: str, argon2_salt: byt
     print("\n--- Passwort aktualisieren ---")
     try:
         account_id = int(input("Geben Sie die ID des zu aktualisierenden Eintrags ein: ").strip())
-        new_password = input("Geben Sie das NEUE Passwort ein: ").strip()
+        try:
+            new_password = getpass.getpass("Geben Sie das NEUE Passwort ein: ").strip()
+        except ImportError:
+            new_password = input("Geben Sie das NEUE Passwort ein: ").strip()
+            
     except ValueError:
         print("❌ Ungültige ID-Eingabe.")
         return
 
     if new_password:
-        if update_account_password(account_id, new_password, master_password, argon2_salt):
+        if update_account_password(account_id, new_password, master_password, argon2_salt, username):
             print(f"✅ Eintrag ID {account_id} erfolgreich aktualisiert.")
         else:
-            print(f"❌ Fehler: Eintrag ID {account_id} nicht gefunden oder kein Update durchgeführt.")
+            print(f"❌ Fehler: Eintrag ID {account_id} nicht gefunden.")
     else:
         print("Neues Passwort darf nicht leer sein.")
 
