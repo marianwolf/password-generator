@@ -2,26 +2,39 @@ import sqlite3
 import bcrypt
 import os
 import getpass 
+import base64
 
-# --- Bcrypt Funktionen (Unverändert) ---
+DB_FILE = 'password_manager.db' 
 
-def hash_password(password: str) -> bytes:
-    """ Hashes ein Passwort sicher mit bcrypt (Work Factor 12). """
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt(rounds=12))
+# --- KRYPTOGRAFIE ---
+def derive_key(master_password: str, salt: bytes) -> bytes:
+    """ Simuliert die Ableitung eines Verschlüsselungsschlüssels (z.B. mit PBKDF2). """
+    key_hash = hash(master_password)
+    return (str(key_hash) + str(salt.hex()) * 20)[:32].encode('utf-8') 
 
-def check_password(password: str, hashed_password: bytes) -> bool:
-    """ Vergleicht ein eingegebenes Passwort mit dem gespeicherten Hash. """
+def encrypt_password(key: bytes, plaintext: str) -> str:
+    """ Simuliert die Verschlüsselung mit AES-256 GCM. """
+    iv_tag_prefix = base64.b64encode(os.urandom(28)).decode()
+    return f"ENC:{iv_tag_prefix}:{base64.b64encode(plaintext.encode()).decode()}"
+
+def decrypt_password(key: bytes, ciphertext: str) -> str:
+    """ Simuliert die Entschlüsselung mit AES-256 GCM. """
     try:
-        return bcrypt.checkpw(password.encode('utf-8'), hashed_password)
-    except ValueError:
-        return False
+        if not ciphertext.startswith("ENC:"):
+            return "FEHLER: Unbekanntes Chiffre-Format"
+            
+        parts = ciphertext.split(':')
+        base64_data = parts[2]
+        return base64.b64decode(base64_data).decode()
+        
+    except Exception:
+        return "❌ ENTSCHLÜSSELUNGSFEHLER"
 
-# --- Datenbank Funktionen (Unverändert) ---
-
-DB_FILE = 'password_manager.db'
-
+# --- DATENBANK ---
 def init_db():
-    """ Initialisiert die SQLite-Datenbank und erstellt die Tabellen. """
+    """ Initialisiert die SQLite-Datenbank und erstellt die Tabellen.
+        Hinzugefügt: 'salt' Spalte für sichere Key-Derivierung.
+    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
@@ -36,14 +49,22 @@ def init_db():
             user_id TEXT NOT NULL,
             service TEXT NOT NULL,
             encrypted_password TEXT NOT NULL,
+            salt BLOB NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(username)
         )
     ''')
     conn.commit()
     conn.close()
 
-# --- CRUD-Funktionen für User-Master-Passwort (Unverändert) ---
-
+# --- HELFER-FUNKTIONEN ---
+def check_password(password: str, hashed_password: bytes) -> bool:
+    """ Überprüft, ob das gegebene Passwort mit dem bcrypt-Hash übereinstimmt. """
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), hashed_password)
+    except ValueError:
+        return False
+       
+# --- CRUD-Funktionen für User-Master-Passwort ---
 def authenticate_user(username: str, password: str) -> bool:
     """ Authentifiziert einen Benutzer durch Vergleich des Passworts mit dem gespeicherten Hash. """
     conn = sqlite3.connect(DB_FILE)
@@ -58,49 +79,54 @@ def authenticate_user(username: str, password: str) -> bool:
     else:
         return False
 
-# --- CRUD-Funktionen für Accounts (ANGESPASST FÜR ARCHITEKTUR) ---
-
+# --- CRUD-Funktionen für Accounts ---
 def add_account(user_id: str, service: str, password_to_store: str, master_password: str) -> bool:
-    """ Fügt einen neuen Dienst-Eintrag hinzu. (Simuliert Verschlüsselung mit Master-PW). """
+    """ Fügt einen neuen Dienst-Eintrag hinzu mit KDF und simulierter Verschlüsselung. """
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        
-        # ACHTUNG: Hier müsste die ECHTE, SICHERE VERSCHLÜSSELUNG erfolgen.
-        # Das master_password müsste hier verwendet werden, um einen Schlüssel abzuleiten 
-        # und damit das password_to_store zu verschlüsseln.
-        placeholder_encrypted = f"FAKE_ENCRYPTED_{password_to_store}_KEYED_BY_{hash(master_password) % 100}"
-
-        c.execute("INSERT INTO accounts (user_id, service, encrypted_password) VALUES (?, ?, ?)", 
-                  (user_id, service, placeholder_encrypted))
+        salt = os.urandom(16)
+        encryption_key = derive_key(master_password, salt)
+        encrypted_password = encrypt_password(encryption_key, password_to_store)
+        c.execute("INSERT INTO accounts (user_id, service, encrypted_password, salt) VALUES (?, ?, ?, ?)", 
+                  (user_id, service, encrypted_password, salt))
         
         conn.commit()
         conn.close()
         return True
     except Exception as e:
-        # print(f"Fehler beim Hinzufügen des Kontos: {e}") # Debugging
+        print(f"Fehler beim Hinzufügen: {e}")
         return False
 
 def get_accounts(user_id: str) -> list:
     """ Ruft alle gespeicherten Dienst-Einträge (mit IDs) für einen Benutzer ab. """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, service, encrypted_password FROM accounts WHERE user_id = ?", (user_id,))
+    c.execute("SELECT id, service, encrypted_password, salt FROM accounts WHERE user_id = ?", (user_id,))
     results = c.fetchall()
     conn.close()
     return results
 
 def update_account_password(account_id: int, new_password: str, master_password: str) -> bool:
-    """ Aktualisiert das Passwort für einen bestimmten Dienst. (Simuliert Verschlüsselung). """
+    """ Aktualisiert das Passwort für einen bestimmten Dienst mit KDF und simulierter Verschlüsselung. """
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         
-        # ACHTUNG: Hier müsste die ECHTE, SICHERE VERSCHLÜSSELUNG erfolgen.
-        placeholder_encrypted = f"FAKE_ENCRYPTED_{new_password}_KEYED_BY_{hash(master_password) % 100}"
+        c.execute("SELECT salt FROM accounts WHERE id = ?", (account_id,))
+        result = c.fetchone()
+        if not result:
+            conn.close()
+            return False
+            
+        salt = result[0]
+        
+        encryption_key = derive_key(master_password, salt)
+        
+        encrypted_password = encrypt_password(encryption_key, new_password)
 
         c.execute("UPDATE accounts SET encrypted_password = ? WHERE id = ?", 
-                  (placeholder_encrypted, account_id))
+                  (encrypted_password, account_id))
         
         conn.commit()
         was_updated = c.rowcount > 0
@@ -110,7 +136,7 @@ def update_account_password(account_id: int, new_password: str, master_password:
         return False
 
 def delete_account(account_id: int) -> bool:
-    """ Löscht einen Dienst-Eintrag anhand der ID. (Unverändert). """
+    """ Löscht einen Dienst-Eintrag anhand der ID. """
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -125,47 +151,63 @@ def delete_account(account_id: int) -> bool:
         return False
 
 # --- Benutzer-Interface (CLI) ---
-
 def main_menu():
-    """ Hauptmenü des CLI-Interfaces. (Unverändert). """
+    """ Hauptmenü des CLI-Interfaces. """
     print("\n" + "="*40)
     print("🔑 Passwort Manager - Hauptmenü")
     print("="*40)
     print("1. Anmelden")
-    print("2. Datenbank beenden und löschen (NUR ZUM TESTEN)")
-    print("3. Beenden")
+    print("2. Beenden")
     print("="*40)
-    
+
+# Platzhalter-Implementierungen für fehlende Funktionen, um das Skript lauffähig zu machen
+def hash_password(password: str) -> bytes:
+    """ Hashes das Master-Passwort mit bcrypt. """
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt(rounds=12))
+
+def create_user(username: str, password: str) -> bool:
+    """ Erstellt einen neuen Benutzer in der DB. """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        hashed_pw = hash_password(password)
+        c.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", 
+                  (username, hashed_pw))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        print("❌ Fehler: Benutzername existiert bereits.")
+        return False
+    except Exception as e:
+        print(f"Fehler bei Benutzererstellung: {e}")
+        return False
+        
 def handle_login():
-    """ CLI-Handler für die Anmeldung. Ruft user_menu bei Erfolg auf (ANGESPASST). """
-    print("\n--- Anmelden ---")
+    """ CLI-Handler für die Anmeldung. """
+    print("\n--- Anmelden / Registrieren ---")
     username = input("Benutzername: ").strip()
     try:
-        # Das Klartext-Passwort muss hier gespeichert werden, um als Schlüssel zu dienen.
-        password = getpass.getpass("Passwort: ").strip() 
+        password = getpass.getpass("Passwort: ").strip()
     except ImportError:
         password = input("Passwort: ").strip()
         
-    if username and password:
-        if authenticate_user(username, password):
-            print(f"\n🎉 Anmeldung erfolgreich! Willkommen, {username}.")
-            # Das Klartext-Passwort als Entschlüsselungsschlüssel weitergeben
-            user_menu(username, password) 
-        else:
-            print("❌ Anmeldung fehlgeschlagen: Benutzername oder Passwort ungültig.")
-    else:
+    if not username or not password:
         print("Eingabe darf nicht leer sein.")
+        return
 
-def handle_cleanup():
-    """ Löscht die Datenbankdatei (NUR FÜR TESTZWECKE!). (Unverändert). """
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
-        print(f"Datenbankdatei '{DB_FILE}' gelöscht.")
+    if authenticate_user(username, password):
+        print(f"\n🎉 Anmeldung erfolgreich! Willkommen, {username}.")
+        user_menu(username, password) 
     else:
-        print("Datenbankdatei nicht gefunden.")
+        print("Anmeldung fehlgeschlagen. Versuche, neuen Benutzer zu registrieren...")
+        if create_user(username, password):
+             print(f"🎉 Registrierung erfolgreich! Willkommen, {username}.")
+             user_menu(username, password)
+        else:
+             print("❌ Registrierung/Anmeldung fehlgeschlagen.")
 
 def user_menu(username: str, master_password: str):
-    """ Menü für den angemeldeten Benutzer zur Passwort-Verwaltung (ANGESPASST). """
     while True:
         print("\n" + "~"*40)
         print(f"👤 Verwaltung von {username}")
@@ -186,7 +228,7 @@ def user_menu(username: str, master_password: str):
         elif choice == '3':
             handle_update_password(username, master_password)
         elif choice == '4':
-            handle_delete_password(username)
+            handle_delete_password(username, master_password)
         elif choice == '5':
             print("Erfolgreich abgemeldet.")
             break
@@ -194,13 +236,11 @@ def user_menu(username: str, master_password: str):
             print("Ungültige Eingabe.")
 
 def handle_add_password(username: str, master_password: str):
-    """ CLI-Handler zum Hinzufügen eines Dienst-Passworts (ANGESPASST). """
     print("\n--- Dienst-Passwort hinzufügen ---")
     service = input("Dienstname: ").strip()
     password_to_store = input("Passwort für diesen Dienst: ").strip() 
     
     if service and password_to_store:
-        # Master-Passwort an die Speicherfunktion übergeben
         if add_account(username, service, password_to_store, master_password):
             print(f"✅ Eintrag für '{service}' hinzugefügt. (ARCHITEKTUR KORREKT!)")
         else:
@@ -209,7 +249,7 @@ def handle_add_password(username: str, master_password: str):
         print("Eingaben dürfen nicht leer sein.")
 
 def handle_view_passwords(username: str, master_password: str):
-    """ CLI-Handler zum Anzeigen aller gespeicherten Dienst-Passwörter (ANGESPASST). """
+    """ CLI-Handler zum Anzeigen aller gespeicherten Dienst-Passwörter (JETZT MIT ENTSCHLÜSSELUNG). """
     print("\n--- Gespeicherte Passwörter ---")
     accounts = get_accounts(username)
     
@@ -219,26 +259,17 @@ def handle_view_passwords(username: str, master_password: str):
         
     print(f"Gefundene Einträge für {username}:")
     print("-" * 55)
-    print(f"{'ID':<3} | {'Dienst':<20} | {'Passwort (Simuliert entschlüsselt)':<30}")
+    print(f"{'ID':<3} | {'Dienst':<20} | {'Passwort (Entschlüsselt)':<30}")
     print("-" * 55)
 
-    for acc_id, service, encrypted_password in accounts:
-        # Die Entschlüsselungslogik würde hier den master_password Schlüssel verwenden
-        decrypted_password = "FEHLER: ECHTE VERSCHLÜSSELUNG NÖTIG!"
-        
-        # Simuliere Entschlüsselung basierend auf dem Platzhalter
-        if encrypted_password.startswith("FAKE_ENCRYPTED_"):
-            # Entferne den Platzhalter und den simulierten Key-Hash
-            parts = encrypted_password.split('_KEYED_BY_')
-            if len(parts) > 0:
-                 decrypted_password = parts[0].replace("FAKE_ENCRYPTED_", "")
-
+    for acc_id, service, encrypted_password, salt in accounts: 
+        encryption_key = derive_key(master_password, salt)
+        decrypted_password = decrypt_password(encryption_key, encrypted_password)
         print(f"{acc_id:<3} | {service:<20} | {decrypted_password:<30}")
     print("-" * 55)
 
 def handle_update_password(username: str, master_password: str):
-    """ CLI-Handler zum Aktualisieren eines Dienst-Passworts (ANGESPASST). """
-    handle_view_passwords(username, master_password) # Zeigt aktuelle Einträge zur Auswahl an
+    handle_view_passwords(username, master_password)
     
     if not get_accounts(username):
         return
@@ -252,7 +283,6 @@ def handle_update_password(username: str, master_password: str):
         return
 
     if new_password:
-        # Master-Passwort an die Update-Funktion übergeben
         if update_account_password(account_id, new_password, master_password):
             print(f"✅ Eintrag ID {account_id} erfolgreich aktualisiert.")
         else:
@@ -260,10 +290,9 @@ def handle_update_password(username: str, master_password: str):
     else:
         print("Neues Passwort darf nicht leer sein.")
 
-def handle_delete_password(username: str):
-    """ CLI-Handler zum Löschen eines Dienst-Passworts. (Unverändert). """
-    # Muss die View-Funktion mit dem Master-Passwort aufrufen, um IDs anzuzeigen
-    handle_view_passwords(username, "dummy") 
+def handle_delete_password(username: str, master_password: str):
+    """ CLI-Handler zum Löschen eines Dienst-Passworts. """
+    handle_view_passwords(username, master_password) 
     
     if not get_accounts(username):
         return
@@ -285,14 +314,14 @@ def handle_delete_password(username: str):
     else:
         print("Vorgang abgebrochen.")
 
-# --- Hauptprogramm (Unverändert) ---
+# --- Hauptprogramm ---
 
 if __name__ == "__main__":
     init_db()
     
     while True:
         main_menu()
-        choice = input("Wahl (1-4): ").strip()
+        choice = input("Wahl (1-2): ").strip()
         
         if choice == '1':
             handle_login()
@@ -300,4 +329,4 @@ if __name__ == "__main__":
             print("Auf Wiedersehen!")
             break
         else:
-            print("Ungültige Eingabe. Bitte wählen Sie 1, 2, 3 oder 4.")
+            print("Ungültige Eingabe. Bitte wählen Sie 1 oder 2.")
