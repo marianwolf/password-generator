@@ -3,22 +3,21 @@ import bcrypt
 import os
 import getpass 
 import base64
+import hashlib
 
 DB_FILE = 'password_manager.db' 
 
 # --- KRYPTOGRAFIE ---
 def derive_key(master_password: str, salt: bytes) -> bytes:
-    """ Simuliert die Ableitung eines Verschlüsselungsschlüssels (z.B. mit PBKDF2). """
-    key_hash = hash(master_password)
-    return (str(key_hash) + str(salt.hex()) * 20)[:32].encode('utf-8') 
+    pw_bytes = master_password.encode('utf-8')
+    key = hashlib.sha256(pw_bytes).digest() 
+    return key 
 
 def encrypt_password(key: bytes, plaintext: str) -> str:
-    """ Simuliert die Verschlüsselung mit AES-256 GCM. """
     iv_tag_prefix = base64.b64encode(os.urandom(28)).decode()
     return f"ENC:{iv_tag_prefix}:{base64.b64encode(plaintext.encode()).decode()}"
 
 def decrypt_password(key: bytes, ciphertext: str) -> str:
-    """ Simuliert die Entschlüsselung mit AES-256 GCM. """
     try:
         if not ciphertext.startswith("ENC:"):
             return "FEHLER: Unbekanntes Chiffre-Format"
@@ -32,9 +31,6 @@ def decrypt_password(key: bytes, ciphertext: str) -> str:
 
 # --- DATENBANK ---
 def init_db():
-    """ Initialisiert die SQLite-Datenbank und erstellt die Tabellen.
-        Hinzugefügt: 'salt' Spalte für sichere Key-Derivierung.
-    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
@@ -58,7 +54,6 @@ def init_db():
 
 # --- HELFER-FUNKTIONEN ---
 def check_password(password: str, hashed_password: bytes) -> bool:
-    """ Überprüft, ob das gegebene Passwort mit dem bcrypt-Hash übereinstimmt. """
     try:
         return bcrypt.checkpw(password.encode('utf-8'), hashed_password)
     except ValueError:
@@ -66,7 +61,6 @@ def check_password(password: str, hashed_password: bytes) -> bool:
        
 # --- CRUD-Funktionen für User-Master-Passwort ---
 def authenticate_user(username: str, password: str) -> bool:
-    """ Authentifiziert einen Benutzer durch Vergleich des Passworts mit dem gespeicherten Hash. """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT hashed_password FROM users WHERE username = ?", (username,))
@@ -81,7 +75,6 @@ def authenticate_user(username: str, password: str) -> bool:
 
 # --- CRUD-Funktionen für Accounts ---
 def add_account(user_id: str, service: str, password_to_store: str, master_password: str) -> bool:
-    """ Fügt einen neuen Dienst-Eintrag hinzu mit KDF und simulierter Verschlüsselung. """
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -99,7 +92,6 @@ def add_account(user_id: str, service: str, password_to_store: str, master_passw
         return False
 
 def get_accounts(user_id: str) -> list:
-    """ Ruft alle gespeicherten Dienst-Einträge (mit IDs) für einen Benutzer ab. """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT id, service, encrypted_password, salt FROM accounts WHERE user_id = ?", (user_id,))
@@ -108,7 +100,6 @@ def get_accounts(user_id: str) -> list:
     return results
 
 def update_account_password(account_id: int, new_password: str, master_password: str) -> bool:
-    """ Aktualisiert das Passwort für einen bestimmten Dienst mit KDF und simulierter Verschlüsselung. """
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -136,7 +127,6 @@ def update_account_password(account_id: int, new_password: str, master_password:
         return False
 
 def delete_account(account_id: int) -> bool:
-    """ Löscht einen Dienst-Eintrag anhand der ID. """
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -152,7 +142,6 @@ def delete_account(account_id: int) -> bool:
 
 # --- Benutzer-Interface (CLI) ---
 def main_menu():
-    """ Hauptmenü des CLI-Interfaces. """
     print("\n" + "="*40)
     print("🔑 Passwort Manager - Hauptmenü")
     print("="*40)
@@ -162,11 +151,9 @@ def main_menu():
 
 # Platzhalter-Implementierungen für fehlende Funktionen, um das Skript lauffähig zu machen
 def hash_password(password: str) -> bytes:
-    """ Hashes das Master-Passwort mit bcrypt. """
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt(rounds=12))
 
 def create_user(username: str, password: str) -> bool:
-    """ Erstellt einen neuen Benutzer in der DB. """
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -184,7 +171,6 @@ def create_user(username: str, password: str) -> bool:
         return False
         
 def handle_login():
-    """ CLI-Handler für die Anmeldung. """
     print("\n--- Anmelden / Registrieren ---")
     username = input("Benutzername: ").strip()
     try:
@@ -249,7 +235,6 @@ def handle_add_password(username: str, master_password: str):
         print("Eingaben dürfen nicht leer sein.")
 
 def handle_view_passwords(username: str, master_password: str):
-    """ CLI-Handler zum Anzeigen aller gespeicherten Dienst-Passwörter (JETZT MIT ENTSCHLÜSSELUNG). """
     print("\n--- Gespeicherte Passwörter ---")
     accounts = get_accounts(username)
     
@@ -291,7 +276,6 @@ def handle_update_password(username: str, master_password: str):
         print("Neues Passwort darf nicht leer sein.")
 
 def handle_delete_password(username: str, master_password: str):
-    """ CLI-Handler zum Löschen eines Dienst-Passworts. """
     handle_view_passwords(username, master_password) 
     
     if not get_accounts(username):
@@ -315,7 +299,6 @@ def handle_delete_password(username: str, master_password: str):
         print("Vorgang abgebrochen.")
 
 # --- Hauptprogramm ---
-
 if __name__ == "__main__":
     init_db()
     
