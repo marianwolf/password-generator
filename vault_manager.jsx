@@ -1,9 +1,30 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, collection, query, serverTimestamp } from 'firebase/firestore';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, collection, query, serverTimestamp, addDoc, updateDoc } from 'firebase/firestore';
+import {
+  Key,
+  User,
+  Lock,
+  Unlock,
+  Plus,
+  Edit,
+  Trash2,
+  Eye,
+  EyeOff,
+  Copy,
+  Search,
+  LogOut,
+  Settings,
+  X,
+  ShieldCheck,
+  Zap,
+  ChevronRight,
+  ClipboardCheck,
+  Clipboard
+} from 'lucide-react';
 
-// --- Konfiguration und Initialisierung ---
+// --- Konfiguration und Initialisierung (Globale Variablen) ---
 // Die globalen Variablen __app_id, __firebase_config und __initial_auth_token
 // werden von der Laufzeitumgebung bereitgestellt.
 
@@ -11,44 +32,35 @@ const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-// Initialisiere Firebase (wird nur einmal ausgeführt)
+// Initialisiere Firebase
 let app, db, auth;
 try {
   app = initializeApp(firebaseConfig);
   db = getFirestore(app);
   auth = getAuth(app);
+  // Optional: Setze den Loglevel für Firestore auf Debug, um Probleme besser zu sehen
+  // setLogLevel('debug'); 
 } catch (e) {
   console.error("Firebase Initialisierung fehlgeschlagen:", e);
 }
 
 // --- Kryptographie-Helfer (Web Crypto API) ---
 
-const SALT_LENGTH = 16;
-const IV_LENGTH = 12; // Für AES-GCM
+// Salz für die Master-Key-Ableitung
+const SALT = new TextEncoder().encode("SecureVaultSaltV1");
+const ENCRYPTION_ALGO = 'AES-GCM';
+const IV_LENGTH = 16;
+const KEY_LENGTH = 256;
 
 /**
- * Erzeugt einen zufälligen Salt.
- * @returns {Uint8Array}
+ * Leitet einen kryptografischen Schlüssel aus dem Master-Passwort ab.
+ * @param {string} masterPassword - Das vom Benutzer eingegebene Master-Passwort.
+ * @returns {Promise<CryptoKey>} - Der abgeleitete Schlüssel.
  */
-const generateSalt = () => window.crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
-
-/**
- * Erzeugt eine zufällige Initialization Vector (IV).
- * @returns {Uint8Array}
- */
-const generateIv = () => window.crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-
-/**
- * Leitet einen symmetrischen Schlüssel (AES-GCM) aus dem Master-Passwort ab.
- * @param {string} masterPassword Das Master-Passwort des Benutzers.
- * @param {Uint8Array} salt Der Salt, der für die Schlüsselableitung verwendet wird.
- * @returns {Promise<CryptoKey>} Der abgeleitete Schlüssel.
- */
-const deriveKey = async (masterPassword, salt) => {
-  const enc = new TextEncoder();
-  const keyMaterial = await window.crypto.subtle.importKey(
+const getKeyFromMaster = async (masterPassword) => {
+  const masterKey = await window.crypto.subtle.importKey(
     'raw',
-    enc.encode(masterPassword),
+    new TextEncoder().encode(masterPassword),
     { name: 'PBKDF2' },
     false,
     ['deriveKey']
@@ -57,689 +69,793 @@ const deriveKey = async (masterPassword, salt) => {
   return window.crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
-      salt: salt,
+      salt: SALT,
       iterations: 100000,
       hash: 'SHA-256',
     },
-    keyMaterial,
-    { name: 'AES-GCM', length: 256 },
-    true,
+    masterKey,
+    { name: ENCRYPTION_ALGO, length: KEY_LENGTH },
+    false,
     ['encrypt', 'decrypt']
   );
 };
 
 /**
- * Verschlüsselt Text mit einem abgeleiteten Schlüssel und speichert Salt und IV.
- * @param {CryptoKey} key Der AES-GCM-Schlüssel.
- * @param {string} plaintext Der zu verschlüsselnde Text (z.B. das Passwort).
- * @returns {Promise<{ciphertext: string, iv: string, salt: string}>}
+ * Verschlüsselt einen String.
+ * @param {string} text - Der zu verschlüsselnde Klartext.
+ * @param {CryptoKey} key - Der Verschlüsselungsschlüssel.
+ * @returns {Promise<string>} - Der Base64-kodierte, verschlüsselte String (IV + Ciphertext).
  */
-const encryptText = async (key, plaintext) => {
-  const salt = generateSalt();
-  const iv = generateIv();
+const encrypt = async (text, key) => {
+  const iv = window.crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  const encoded = new TextEncoder().encode(text);
   
-  // Da der Schlüssel für PBKDF2 abgeleitet wird, muss er erst aus dem Master-Passwort abgeleitet werden.
-  // Hier wird der Key, der bereits ein CryptoKey ist, direkt verwendet.
-  // Das Salt muss in der Datenbank gespeichert werden, falls der Schlüssel neu abgeleitet werden muss (z.B. bei einem Browser-Neustart).
-  // Da der `key` hier bereits der aus dem Master-Passwort *abgeleitete* Schlüssel ist, muss das ursprüngliche PBKDF2-Salt 
-  // entweder separat behandelt oder man leitet den Schlüssel pro Eintrag neu ab, was ineffizient ist.
-  // Zur Vereinfachung (da der Master-Passwort-Key im State gespeichert wird) überspringen wir die Salt-Speicherung für die Key-Derivation
-  // und verwenden nur IV für AES-GCM. 
-  // WICHTIG: In einer echten Anwendung müsste das PBKDF2-Salt persistent gespeichert werden, um den Master-Schlüssel wiederherzustellen.
-  
-  const enc = new TextEncoder();
-  const ciphertextBuffer = await window.crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: iv },
+  const encrypted = await window.crypto.subtle.encrypt(
+    { name: ENCRYPTION_ALGO, iv },
     key,
-    enc.encode(plaintext)
+    encoded
   );
 
-  return {
-    ciphertext: btoa(String.fromCharCode(...new Uint8Array(ciphertextBuffer))),
-    iv: btoa(String.fromCharCode(...iv)),
-  };
+  const fullArray = new Uint8Array(iv.length + encrypted.byteLength);
+  fullArray.set(iv, 0);
+  fullArray.set(new Uint8Array(encrypted), iv.length);
+  
+  return btoa(String.fromCharCode.apply(null, fullArray));
 };
 
 /**
- * Entschlüsselt Text.
- * @param {CryptoKey} key Der AES-GCM-Schlüssel.
- * @param {string} ciphertext Der verschlüsselte Text.
- * @param {string} iv Der Initialization Vector (Base64).
- * @returns {Promise<string>} Der entschlüsselte Text.
+ * Entschlüsselt einen Base64-String.
+ * @param {string} encryptedBase64 - Der Base64-kodierte, verschlüsselte String.
+ * @param {CryptoKey} key - Der Entschlüsselungsschlüssel.
+ * @returns {Promise<string|null>} - Der entschlüsselte Klartext oder null bei Fehler.
  */
-const decryptText = async (key, ciphertext, iv) => {
+const decrypt = async (encryptedBase64, key) => {
   try {
-    const rawCiphertext = new Uint8Array(atob(ciphertext).split('').map(char => char.charCodeAt(0)));
-    const rawIv = new Uint8Array(atob(iv).split('').map(char => char.charCodeAt(0)));
-
-    const decryptedBuffer = await window.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: rawIv },
-      key,
-      rawCiphertext
-    );
-
-    const dec = new TextDecoder();
-    return dec.decode(decryptedBuffer);
-  } catch (error) {
-    console.error("Entschlüsselung fehlgeschlagen:", error);
-    return "[ENTSTELLUNG FEHLGESCHLAGEN]";
-  }
-};
-
-// --- Komponenten und Haupt-App ---
-
-// Hilfsfunktion zum Kopieren in die Zwischenablage (iFrame-sicherer Fallback)
-const copyToClipboard = (text) => {
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  document.body.appendChild(textarea);
-  textarea.select();
-  try {
-    document.execCommand('copy');
-    return true;
-  } catch (err) {
-    console.error('Kopieren fehlgeschlagen:', err);
-    return false;
-  } finally {
-    document.body.removeChild(textarea);
-  }
-};
-
-// Passwortgenerator Logik
-const generatePassword = (length = 16, options = {}) => {
-  const { lower = true, upper = true, number = true, symbol = true } = options;
-  let charset = '';
-  if (lower) charset += 'abcdefghijklmnopqrstuvwxyz';
-  if (upper) charset += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  if (number) charset += '0123456789';
-  if (symbol) charset += '!@#$%^&*()-=_+[]{}|;:,.<>?';
-
-  if (charset.length === 0) return '';
-
-  let password = '';
-  const charArray = Array.from(charset);
-  const randomBytes = new Uint32Array(length);
-  window.crypto.getRandomValues(randomBytes);
-
-  for (let i = 0; i < length; i++) {
-    password += charArray[randomBytes[i] % charArray.length];
-  }
-
-  return password;
-};
-
-
-// --- Hauptkomponente: App ---
-const App = () => {
-  const [authState, setAuthState] = useState({
-    isAuthReady: false,
-    userId: null,
-    db: null,
-  });
-  const [vault, setVault] = useState([]);
-  const [masterPasswordInput, setMasterPasswordInput] = useState('');
-  const [masterKey, setMasterKey] = useState(null); // Der abgeleitete CryptoKey
-  const [isLocked, setIsLocked] = useState(true);
-  const [error, setError] = useState('');
-  const [filter, setFilter] = useState('');
-  const [showAddEditModal, setShowAddEditModal] = useState(false);
-  const [currentEntry, setCurrentEntry] = useState(null); // Für Bearbeitung
-
-  const { isAuthReady, userId } = authState;
-
-  // 1. Firebase Auth und Setup
-  useEffect(() => {
-    if (!app || !auth || !db) return;
-
-    const setupAuth = async () => {
-      try {
-        if (initialAuthToken) {
-          await signInWithCustomToken(auth, initialAuthToken);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (e) {
-        console.error("Fehler beim Anmelden:", e);
-      }
-    };
-
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setAuthState({
-        isAuthReady: true,
-        userId: user ? user.uid : null,
-        db: db,
-      });
-    });
-
-    setupAuth();
-    return () => unsubscribe();
-  }, []);
-
-  // 2. Vault-Pfad
-  const vaultCollectionPath = useMemo(() => {
-    if (userId) {
-      // Speichere private Daten unter dem Benutzerpfad
-      return `artifacts/${appId}/users/${userId}/passwords`;
-    }
-    return null;
-  }, [userId]);
-
-  // 3. Vault-Daten aus Firestore laden (verschlüsselt)
-  useEffect(() => {
-    if (!vaultCollectionPath || isLocked) return;
-
-    const q = query(collection(db, vaultCollectionPath));
-
-    const unsubscribe = onSnapshot(q, async (snapshot) => {
-      const encryptedEntries = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-      }));
-
-      // Versuche, alle Einträge zu entschlüsseln, wenn der Master-Schlüssel verfügbar ist
-      if (masterKey) {
-        const decryptedVault = await Promise.all(encryptedEntries.map(async (entry) => {
-          try {
-            const decryptedPassword = await decryptText(masterKey, entry.encryptedPassword.ciphertext, entry.encryptedPassword.iv);
-            return {
-              ...entry,
-              password: decryptedPassword,
-            };
-          } catch (e) {
-            console.error("Fehler beim Entschlüsseln eines Eintrags:", e);
-            return {
-              ...entry,
-              password: "[DECRYPT ERROR]",
-            };
-          }
-        }));
-        setVault(decryptedVault.sort((a, b) => (b.createdAt?.toMillis() || 0) - (a.createdAt?.toMillis() || 0)));
-      } else {
-        // Sollte nicht passieren, wenn die Sperre aktiv ist
-        setVault([]);
-      }
-    }, (e) => {
-      console.error("Firestore Snapshot Fehler:", e);
-    });
-
-    // Clean-up Funktion
-    return () => unsubscribe();
-  }, [vaultCollectionPath, masterKey, isLocked]);
-
-
-  // 4. Entsperr-Logik (Key-Ableitung)
-  const handleUnlock = async () => {
-    setError('');
-    if (!masterPasswordInput) {
-      setError('Bitte Master-Passwort eingeben.');
-      return;
-    }
-
-    // Wir benötigen ein konsistentes Salt, um den Schlüssel abzuleiten. 
-    // FÜR DIESES BEISPIEL: Da wir nur einen Session-Key ableiten, 
-    // verwenden wir ein statisches, nicht geheimes App-Salt für PBKDF2.
-    // In einer ECHTEN App müsste das PBKDF2-Salt persistent (aber öffentlich) gespeichert werden!
-    const staticSalt = new TextEncoder().encode("VaultManagerStaticSalt");
-
-    try {
-      const derivedKey = await deriveKey(masterPasswordInput, staticSalt);
-      setMasterKey(derivedKey);
-      setIsLocked(false);
-      setMasterPasswordInput(''); // Master-Passwort sofort löschen
-    } catch (e) {
-      console.error("Schlüsselableitung fehlgeschlagen:", e);
-      setError('Ungültiges Master-Passwort.');
-    }
-  };
-
-  // 5. Eintrag speichern/bearbeiten
-  const handleSaveEntry = async (entryData) => {
-    if (!masterKey || !vaultCollectionPath) {
-      setError('Vault ist nicht entsperrt.');
-      return;
-    }
-
-    try {
-      // 1. Passwort verschlüsseln
-      const encryptedData = await encryptText(masterKey, entryData.password);
-
-      // 2. Daten für Firestore vorbereiten (ID nur, wenn es eine Bearbeitung ist)
-      const dataToSave = {
-        serviceName: entryData.serviceName || 'Unbenannter Service',
-        username: entryData.username || 'n/a',
-        url: entryData.url || '',
-        notes: entryData.notes || '',
-        encryptedPassword: encryptedData, // Enthält ciphertext und iv
-        createdAt: entryData.id ? entryData.createdAt : serverTimestamp(),
-      };
-
-      const docRef = entryData.id 
-        ? doc(db, vaultCollectionPath, entryData.id) 
-        : doc(collection(db, vaultCollectionPath)); // Firestore generiert die ID
-
-      await setDoc(docRef, dataToSave, { merge: true });
-      setShowAddEditModal(false);
-      setCurrentEntry(null);
-    } catch (e) {
-      console.error("Fehler beim Speichern des Eintrags:", e);
-      setError('Speichern fehlgeschlagen: ' + e.message);
-    }
-  };
-
-  // 6. Eintrag löschen
-  const handleDeleteEntry = async (id) => {
-    if (!vaultCollectionPath) return;
-
-    if (window.confirm("Sind Sie sicher, dass Sie diesen Eintrag löschen möchten?")) {
-      try {
-        await deleteDoc(doc(db, vaultCollectionPath, id));
-      } catch (e) {
-        console.error("Fehler beim Löschen des Eintrags:", e);
-        setError('Löschen fehlgeschlagen: ' + e.message);
-      }
-    }
-  };
-  
-  // 7. Gefilterte Vault-Liste
-  const filteredVault = useMemo(() => {
-    const lowerCaseFilter = filter.toLowerCase();
-    return vault.filter(entry =>
-      entry.serviceName?.toLowerCase().includes(lowerCaseFilter) ||
-      entry.username?.toLowerCase().includes(lowerCaseFilter) ||
-      entry.url?.toLowerCase().includes(lowerCaseFilter)
-    );
-  }, [vault, filter]);
-
-
-  // --- UI Komponenten: Passwortkarte (PasswordCard) ---
-  const PasswordCard = ({ entry }) => {
-    const [showPassword, setShowPassword] = useState(false);
-    const [copyStatus, setCopyStatus] = useState(null); // 'password', 'username', null
-
-    const handleCopy = (text, type) => {
-      if (copyToClipboard(text)) {
-        setCopyStatus(type);
-        setTimeout(() => setCopyStatus(null), 1500);
-      }
-    };
-
-    const handleEdit = () => {
-      // Setzt den Eintrag und öffnet das Modal
-      setCurrentEntry(entry);
-      setShowAddEditModal(true);
-    };
-
-    return (
-      <div className="bg-white p-4 shadow-xl rounded-xl transition duration-300 ease-in-out hover:shadow-2xl flex flex-col space-y-3">
-        <div className="flex justify-between items-start">
-          <div className="flex-1 min-w-0">
-            <h3 className="text-xl font-bold text-gray-800 truncate" title={entry.serviceName}>
-              {entry.serviceName}
-            </h3>
-            {entry.url && (
-              <a 
-                href={entry.url.startsWith('http') ? entry.url : `https://${entry.url}`} 
-                target="_blank" 
-                rel="noopener noreferrer" 
-                className="text-sm text-blue-600 hover:underline truncate block"
-                title={entry.url}
-              >
-                {entry.url.replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0]}
-              </a>
-            )}
-          </div>
-          <div className="flex space-x-2 ml-4 flex-shrink-0">
-            <button 
-                onClick={() => handleEdit(entry)}
-                className="p-2 text-blue-500 hover:text-blue-700 rounded-full transition duration-150"
-                title="Eintrag bearbeiten"
-            >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                  <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zm-5.464 5.464a1 1 0 000 1.414l5.464 5.464a1 1 0 001.414 0 1 1 0 000-1.414l-5.464-5.464a1 1 0 00-1.414 0z" />
-                </svg>
-            </button>
-            <button 
-                onClick={() => handleDeleteEntry(entry.id)}
-                className="p-2 text-red-500 hover:text-red-700 rounded-full transition duration-150"
-                title="Eintrag löschen"
-            >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                  <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
-                </svg>
-            </button>
-          </div>
-        </div>
-
-        {/* Benutzername Sektion */}
-        <div className="flex items-center space-x-2 bg-gray-50 p-2 rounded-lg">
-          <span className="text-gray-500 font-medium w-24">Nutzername:</span>
-          <span className="flex-1 font-mono text-sm break-all">{entry.username}</span>
-          <button 
-            onClick={() => handleCopy(entry.username, 'username')}
-            className={`p-1 rounded-full text-white text-xs font-semibold ${copyStatus === 'username' ? 'bg-green-500' : 'bg-blue-500 hover:bg-blue-600'}`}
-          >
-            {copyStatus === 'username' ? 'Kopiert!' : 'Kopieren'}
-          </button>
-        </div>
-
-        {/* Passwort Sektion */}
-        <div className="flex items-center space-x-2 bg-gray-50 p-2 rounded-lg">
-          <span className="text-gray-500 font-medium w-24">Passwort:</span>
-          <span className="flex-1 font-mono text-sm break-all">
-            {showPassword ? entry.password : '••••••••••••••••'}
-          </span>
-          <button 
-            onClick={() => setShowPassword(!showPassword)}
-            className="p-1 text-gray-600 hover:text-gray-800 transition duration-150"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-              {showPassword ? (
-                <path fillRule="evenodd" d="M3.707 2.293a1 1 0 00-1.414 1.414l14 14a1 1 0 001.414-1.414l-14-14zM10 5a5 5 0 00-7.07 1.93l-1.42 1.42a1 1 0 000 1.41l8.49 8.49a1 1 0 001.41 0l1.42-1.42A5 5 0 0015 10a5 5 0 00-1.55-3.55l1.41-1.41a1 1 0 00-1.41-1.41l-1.41 1.41A5.002 5.002 0 0010 5zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
-              ) : (
-                <path d="M10 12.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5z" />
-              )}
-            </svg>
-          </button>
-          <button 
-            onClick={() => handleCopy(entry.password, 'password')}
-            className={`p-1 rounded-full text-white text-xs font-semibold ${copyStatus === 'password' ? 'bg-green-500' : 'bg-blue-500 hover:bg-blue-600'}`}
-          >
-            {copyStatus === 'password' ? 'Kopiert!' : 'Kopieren'}
-          </button>
-        </div>
-
-        {/* Notizen Sektion */}
-        {entry.notes && (
-          <div className="bg-gray-100 p-3 rounded-lg border-l-4 border-yellow-500">
-            <p className="text-sm font-semibold text-gray-700">Notizen:</p>
-            <p className="text-sm text-gray-600 mt-1 whitespace-pre-wrap">{entry.notes}</p>
-          </div>
-        )}
-      </div>
-    );
-  };
-  
-  // --- UI Komponenten: Passwort-Generator-Modal (PasswordGenerator) ---
-  const PasswordGenerator = ({ onGenerate }) => {
-    const [length, setLength] = useState(16);
-    const [options, setOptions] = useState({ lower: true, upper: true, number: true, symbol: true });
-    const [generatedPwd, setGeneratedPwd] = useState(generatePassword(16, options));
-
-    useEffect(() => {
-        setGeneratedPwd(generatePassword(length, options));
-    }, [length, options]);
+    const binaryStr = atob(encryptedBase64);
+    const fullArray = Uint8Array.from(binaryStr, c => c.charCodeAt(0));
     
-    const handleChange = (e) => {
-        const newOptions = { ...options, [e.target.name]: e.target.checked };
-        setOptions(newOptions);
+    if (fullArray.length < IV_LENGTH) {
+      console.error("Daten sind zu kurz für IV");
+      return null;
+    }
+
+    const iv = fullArray.slice(0, IV_LENGTH);
+    const ciphertext = fullArray.slice(IV_LENGTH);
+
+    const decrypted = await window.crypto.subtle.decrypt(
+      { name: ENCRYPTION_ALGO, iv },
+      key,
+      ciphertext
+    );
+    
+    return new TextDecoder().decode(decrypted);
+
+  } catch (error) {
+    // Fehler beim Entschlüsseln (wahrscheinlich falscher Master-Key)
+    console.error("Entschlüsselungsfehler:", error);
+    return null;
+  }
+};
+
+
+// --- UI-Komponenten ---
+
+/**
+ * Kleine Komponente zum Anzeigen von Kopierstatus.
+ */
+const CopyButton = ({ textToCopy }) => {
+    const [copied, setCopied] = useState(false);
+
+    const handleCopy = () => {
+        // execCommand('copy') ist robuster in iFrames
+        const el = document.createElement('textarea');
+        el.value = textToCopy;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
     };
 
     return (
-        <div className="p-4 bg-gray-50 rounded-xl shadow-inner mt-4">
-            <h4 className="text-lg font-semibold mb-3 text-gray-700">Passwort-Generator</h4>
+        <button 
+            onClick={handleCopy}
+            className={`transition-all duration-300 p-1 rounded-full ${copied ? 'bg-green-500 text-white' : 'hover:bg-gray-200 text-gray-500'}`}
+            title={copied ? "Kopiert!" : "Kopieren"}
+        >
+            {copied ? <ClipboardCheck className="w-4 h-4" /> : <Clipboard className="w-4 h-4" />}
+        </button>
+    );
+};
+
+/**
+ * Karte für einen einzelnen Passwort-Eintrag.
+ */
+const PasswordCard = ({ entry, decryptedKey, onEdit, onRequestDelete }) => {
+    const [isPasswordVisible, setIsPasswordVisible] = useState(false);
+    const [decryptedValues, setDecryptedValues] = useState({ password: '***', username: '***' });
+    const [isDecrypted, setIsDecrypted] = useState(false);
+
+    // Entschlüsselt die Daten, wenn der Schlüssel bereit ist
+    useEffect(() => {
+        const loadDecrypted = async () => {
+            if (!decryptedKey) return;
+            try {
+                const pass = await decrypt(entry.encryptedPassword, decryptedKey);
+                const user = await decrypt(entry.encryptedUsername, decryptedKey);
+                setDecryptedValues({ 
+                    password: pass || '[Entschlüsselungsfehler]', 
+                    username: user || '[Entschlüsselungsfehler]' 
+                });
+                setIsDecrypted(true);
+            } catch (e) {
+                console.error("Fehler beim Entschlüsseln der Kartendaten:", e);
+                setDecryptedValues({ password: '[Fehler]', username: '[Fehler]' });
+                setIsDecrypted(false);
+            }
+        };
+
+        loadDecrypted();
+    }, [entry, decryptedKey]);
+
+    const displayPassword = isDecrypted ? (isPasswordVisible ? decryptedValues.password : '••••••••••••••••') : decryptedValues.password;
+    const displayUsername = isDecrypted ? decryptedValues.username : decryptedValues.username;
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-xl transition-all duration-300 hover:shadow-2xl flex flex-col justify-between">
+            <div>
+                <div className="flex items-center justify-between mb-3 border-b pb-2">
+                    <h3 className="text-xl font-bold text-gray-800 truncate">{entry.serviceName}</h3>
+                    <div className="flex space-x-2">
+                        <button onClick={() => onEdit(entry)} className="p-2 text-blue-600 hover:text-blue-800 transition-colors rounded-full hover:bg-blue-50" title="Bearbeiten">
+                            <Edit className="w-4 h-4" />
+                        </button>
+                        <button onClick={() => onRequestDelete(entry)} className="p-2 text-red-600 hover:text-red-800 transition-colors rounded-full hover:bg-red-50" title="Löschen">
+                            <Trash2 className="w-4 h-4" />
+                        </button>
+                    </div>
+                </div>
+
+                <div className="space-y-3 text-sm">
+                    {/* Benutzername */}
+                    <div className="flex items-center justify-between bg-gray-50 p-3 rounded-lg">
+                        <div className="flex items-center">
+                            <User className="w-4 h-4 text-gray-400 mr-3" />
+                            <span className="font-medium text-gray-600 mr-2">Benutzername:</span>
+                            <span className="text-gray-800 font-mono truncate max-w-[120px] sm:max-w-full">{displayUsername}</span>
+                        </div>
+                        <CopyButton textToCopy={decryptedValues.username} />
+                    </div>
+
+                    {/* Passwort */}
+                    <div className="flex items-center justify-between bg-gray-50 p-3 rounded-lg">
+                        <div className="flex items-center">
+                            <Key className="w-4 h-4 text-gray-400 mr-3" />
+                            <span className="font-medium text-gray-600 mr-2">Passwort:</span>
+                            <span className="text-gray-800 font-mono truncate max-w-[120px] sm:max-w-full">{displayPassword}</span>
+                        </div>
+                        <div className="flex space-x-2 items-center">
+                            <button 
+                                onClick={() => setIsPasswordVisible(!isPasswordVisible)} 
+                                className="p-1 text-gray-500 hover:text-gray-700 rounded-full hover:bg-gray-200"
+                                title={isPasswordVisible ? "Verbergen" : "Anzeigen"}
+                                disabled={!isDecrypted}
+                            >
+                                {isPasswordVisible ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                            <CopyButton textToCopy={decryptedValues.password} />
+                        </div>
+                    </div>
+                    
+                    {/* URL */}
+                    {entry.url && (
+                        <div className="flex items-center bg-gray-50 p-3 rounded-lg">
+                            <ChevronRight className="w-4 h-4 text-gray-400 mr-3" />
+                            <a href={entry.url.startsWith('http') ? entry.url : `https://${entry.url}`} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline truncate">
+                                {entry.url}
+                            </a>
+                        </div>
+                    )}
+                </div>
+            </div>
             
-            <div className="mb-4">
-                <label className="block text-sm font-medium text-gray-700">Länge: {length}</label>
-                <input
-                    type="range"
-                    min="8"
-                    max="32"
-                    value={length}
-                    onChange={(e) => setLength(Number(e.target.value))}
-                    className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer range-lg"
-                />
-            </div>
-
-            <div className="grid grid-cols-2 gap-2 mb-4 text-sm">
-                <label className="flex items-center">
-                    <input type="checkbox" name="lower" checked={options.lower} onChange={handleChange} className="mr-2 rounded text-blue-600" />
-                    Kleinbuchstaben (a-z)
-                </label>
-                <label className="flex items-center">
-                    <input type="checkbox" name="upper" checked={options.upper} onChange={handleChange} className="mr-2 rounded text-blue-600" />
-                    Großbuchstaben (A-Z)
-                </label>
-                <label className="flex items-center">
-                    <input type="checkbox" name="number" checked={options.number} onChange={handleChange} className="mr-2 rounded text-blue-600" />
-                    Zahlen (0-9)
-                </label>
-                <label className="flex items-center">
-                    <input type="checkbox" name="symbol" checked={options.symbol} onChange={handleChange} className="mr-2 rounded text-blue-600" />
-                    Symbole (!@#$%)
-                </label>
-            </div>
-
-            <div className="flex items-center space-x-3 bg-white p-3 border border-gray-300 rounded-lg">
-                <span className="flex-1 font-mono text-sm break-all">{generatedPwd}</span>
-                <button
-                    type="button"
-                    onClick={() => onGenerate(generatedPwd)}
-                    className="px-3 py-1 bg-green-500 text-white text-sm font-semibold rounded-lg hover:bg-green-600 transition"
-                >
-                    Übernehmen
-                </button>
-            </div>
+            <p className="text-xs text-right text-gray-400 mt-4">
+                ID: {entry.id.substring(0, 8)}...
+            </p>
         </div>
     );
-  };
-  
+};
 
-  // --- UI Komponenten: Add/Edit Modal (AddEditModal) ---
-  const AddEditModal = ({ isOpen, onClose, onSave, entry }) => {
-    const [formData, setFormData] = useState({
-      serviceName: '', username: '', password: '', url: '', notes: '',
-    });
+/**
+ * Modal zum Hinzufügen oder Bearbeiten eines Eintrags.
+ */
+const AddEditModal = ({ isOpen, onClose, onSave, entry, isLoading }) => {
+    const [serviceName, setServiceName] = useState('');
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
+    const [url, setUrl] = useState('');
+    const [isPasswordVisible, setIsPasswordVisible] = useState(false);
+    const [error, setError] = useState('');
 
     useEffect(() => {
-      if (entry) {
-        setFormData({
-          serviceName: entry.serviceName || '',
-          username: entry.username || '',
-          password: entry.password || '', // Entschlüsseltes Passwort
-          url: entry.url || '',
-          notes: entry.notes || '',
-        });
-      } else {
-        setFormData({ serviceName: '', username: '', password: '', url: '', notes: '' });
-      }
+        if (entry) {
+            // Wenn ein Eintrag zum Bearbeiten vorhanden ist, fülle die Felder aus
+            setServiceName(entry.serviceName || '');
+            // ACHTUNG: Die entschlüsselten Werte müssen von der übergeordneten Komponente bereitgestellt werden!
+            // Da wir in der VaultManager-Komponente die Entschlüsselung in der PasswordCard durchgeführt haben,
+            // ist es für die Bearbeitung notwendig, die entschlüsselten Werte vom Benutzer neu eingeben zu lassen
+            // oder eine Funktion bereitzustellen, die die aktuellen entschlüsselten Werte abruft.
+            // Vereinfachung: Für die Bearbeitung zeigen wir Platzhalter, und der Benutzer MUSS sie neu eingeben.
+            setUsername('[Wird neu eingegeben]');
+            setPassword('[Wird neu eingegeben]');
+            setUrl(entry.url || '');
+        } else {
+            // Neuer Eintrag
+            setServiceName('');
+            setUsername('');
+            setPassword('');
+            setUrl('');
+        }
+        setError('');
     }, [entry, isOpen]);
-
-    if (!isOpen) return null;
-
-    const handleChange = (e) => {
-      setFormData({ ...formData, [e.target.name]: e.target.value });
-    };
-
-    const handleGeneratePassword = (newPassword) => {
-        setFormData(prev => ({ ...prev, password: newPassword }));
+    
+    // Einfache Funktion zur Passwort-Generierung
+    const generatePassword = () => {
+        const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
+        let newPassword = '';
+        for (let i = 0; i < 16; i++) {
+            newPassword += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        setPassword(newPassword);
     };
 
     const handleSubmit = (e) => {
-      e.preventDefault();
-      onSave({ ...formData, id: entry?.id, createdAt: entry?.createdAt });
+        e.preventDefault();
+        if (!serviceName || !username || !password) {
+            setError('Bitte Dienstname, Benutzername und Passwort eingeben.');
+            return;
+        }
+
+        const dataToSave = {
+            id: entry ? entry.id : null,
+            serviceName,
+            username: username === '[Wird neu eingegeben]' ? '' : username, // Leere String, wenn nicht geändert
+            password: password === '[Wird neu eingegeben]' ? '' : password,
+            url
+        };
+        
+        onSave(dataToSave, entry); // Sende das ursprüngliche Eintragsobjekt mit, um die Encrypted-Daten beizubehalten, falls nicht neu eingegeben
+
+        onClose();
+    };
+
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex justify-center items-center p-4" onClick={onClose}>
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6 md:p-8 relative" onClick={e => e.stopPropagation()}>
+                <button onClick={onClose} className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 p-1 transition-colors">
+                    <X className="w-6 h-6" />
+                </button>
+                
+                <h2 className="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">{entry ? 'Eintrag bearbeiten' : 'Neuen Eintrag hinzufügen'}</h2>
+
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div className="space-y-2">
+                        <label htmlFor="serviceName" className="block text-sm font-medium text-gray-700">Dienstname</label>
+                        <input
+                            id="serviceName"
+                            type="text"
+                            value={serviceName}
+                            onChange={(e) => setServiceName(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500"
+                            required
+                            disabled={isLoading}
+                        />
+                    </div>
+                    
+                    <div className="space-y-2">
+                        <label htmlFor="username" className="block text-sm font-medium text-gray-700">Benutzername (oder E-Mail)</label>
+                        <input
+                            id="username"
+                            type="text"
+                            value={username}
+                            onChange={(e) => setUsername(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500"
+                            required
+                            disabled={isLoading}
+                        />
+                    </div>
+                    
+                    <div className="space-y-2">
+                        <label htmlFor="password" className="block text-sm font-medium text-gray-700">Passwort</label>
+                        <div className="relative">
+                            <input
+                                id="password"
+                                type={isPasswordVisible ? 'text' : 'password'}
+                                value={password}
+                                onChange={(e) => setPassword(e.target.value)}
+                                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 pr-10"
+                                required
+                                disabled={isLoading}
+                            />
+                            <button
+                                type="button"
+                                onClick={() => setIsPasswordVisible(!isPasswordVisible)}
+                                className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-500 hover:text-gray-700"
+                                title={isPasswordVisible ? "Verbergen" : "Anzeigen"}
+                            >
+                                {isPasswordVisible ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                            </button>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={generatePassword}
+                            className="flex items-center text-blue-600 hover:text-blue-800 text-sm font-medium mt-1 transition-colors"
+                            disabled={isLoading}
+                        >
+                            <Zap className="w-4 h-4 mr-1" /> Passwort generieren
+                        </button>
+                    </div>
+
+                    <div className="space-y-2">
+                        <label htmlFor="url" className="block text-sm font-medium text-gray-700">URL (optional)</label>
+                        <input
+                            id="url"
+                            type="url"
+                            placeholder="https://beispiel.de"
+                            value={url}
+                            onChange={(e) => setUrl(e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500"
+                            disabled={isLoading}
+                        />
+                    </div>
+
+                    {error && (
+                        <p className="text-red-500 text-sm">{error}</p>
+                    )}
+
+                    <button
+                        type="submit"
+                        className="w-full bg-blue-600 text-white p-3 rounded-lg font-semibold hover:bg-blue-700 transition-colors flex items-center justify-center disabled:opacity-50"
+                        disabled={isLoading}
+                    >
+                        {isLoading ? (
+                            <Settings className="w-5 h-5 animate-spin mr-2" />
+                        ) : (
+                            <Plus className="w-5 h-5 mr-2" />
+                        )}
+                        {entry ? 'Speichern' : 'Hinzufügen'}
+                    </button>
+                </form>
+            </div>
+        </div>
+    );
+};
+
+/**
+ * Modal zur Bestätigung des Löschvorgangs.
+ */
+const DeleteConfirmationModal = ({ isOpen, onClose, entry, onConfirm }) => {
+    if (!isOpen || !entry) return null;
+
+    const handleConfirm = () => {
+        onConfirm(entry.id);
+        onClose();
     };
 
     return (
-      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-        <div className="bg-white rounded-2xl w-full max-w-lg shadow-2xl p-6 relative">
-          <h2 className="text-2xl font-bold text-gray-800 mb-4">{entry ? 'Eintrag bearbeiten' : 'Neuen Eintrag hinzufügen'}</h2>
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex justify-center items-center p-4" onClick={onClose}>
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 relative" onClick={e => e.stopPropagation()}>
+                <h2 className="text-xl font-bold text-red-600 mb-4">Löschung bestätigen</h2>
+                <p className="text-gray-700 mb-6">
+                    Sind Sie sicher, dass Sie den Eintrag für <strong>{entry.serviceName}</strong> dauerhaft löschen möchten? Diese Aktion kann nicht rückgängig gemacht werden.
+                </p>
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700">Service-Name</label>
-              <input type="text" name="serviceName" value={formData.serviceName} onChange={handleChange} required className="mt-1 block w-full border border-gray-300 rounded-lg p-2 focus:ring-blue-500 focus:border-blue-500" />
+                <div className="flex justify-end space-x-3">
+                    <button 
+                        onClick={onClose} 
+                        className="px-4 py-2 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 transition-colors font-medium"
+                    >
+                        Abbrechen
+                    </button>
+                    <button 
+                        onClick={handleConfirm} 
+                        className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium flex items-center"
+                    >
+                        <Trash2 className="w-4 h-4 mr-2" /> Löschen
+                    </button>
+                </div>
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700">Benutzername/E-Mail</label>
-              <input type="text" name="username" value={formData.username} onChange={handleChange} required className="mt-1 block w-full border border-gray-300 rounded-lg p-2 focus:ring-blue-500 focus:border-blue-500" />
-            </div>
-            
-            <PasswordGenerator onGenerate={handleGeneratePassword} />
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700">Passwort</label>
-              <input type="text" name="password" value={formData.password} onChange={handleChange} required className="mt-1 block w-full border border-gray-300 rounded-lg p-2 font-mono focus:ring-blue-500 focus:border-blue-500" />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700">URL (Optional)</label>
-              <input type="url" name="url" value={formData.url} onChange={handleChange} className="mt-1 block w-full border border-gray-300 rounded-lg p-2 focus:ring-blue-500 focus:border-blue-500" placeholder="https://beispiel.de" />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700">Notizen (Optional)</label>
-              <textarea name="notes" value={formData.notes} onChange={handleChange} rows="3" className="mt-1 block w-full border border-gray-300 rounded-lg p-2 focus:ring-blue-500 focus:border-blue-500"></textarea>
-            </div>
-
-            <div className="flex justify-end space-x-3 pt-4">
-              <button
-                type="button"
-                onClick={onClose}
-                className="px-4 py-2 text-gray-700 bg-gray-200 rounded-xl hover:bg-gray-300 font-semibold transition"
-              >
-                Abbrechen
-              </button>
-              <button
-                type="submit"
-                className="px-4 py-2 bg-blue-600 text-white rounded-xl hover:bg-blue-700 font-semibold shadow-lg shadow-blue-500/50 transition"
-              >
-                Speichern
-              </button>
-            </div>
-          </form>
         </div>
-      </div>
     );
-  };
-  
-
-  // --- Haupt-Render ---
-  if (!isAuthReady) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-gray-50 p-4">
-        <div className="text-lg font-medium text-gray-600">Lade Authentifizierung...</div>
-      </div>
-    );
-  }
-
-  // UI für gesperrten Vault
-  if (isLocked) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4">
-        <div className="w-full max-w-md bg-white p-8 rounded-2xl shadow-2xl">
-          <h1 className="text-3xl font-extrabold text-center text-gray-800 mb-6">
-            <span className="text-blue-600">Secure</span> Vault
-          </h1>
-          <p className="text-center text-gray-600 mb-8">
-            Bitte geben Sie Ihr Master-Passwort ein, um den Vault zu entschlüsseln.
-          </p>
-
-          <div className="space-y-4">
-            <input
-              type="password"
-              value={masterPasswordInput}
-              onChange={(e) => setMasterPasswordInput(e.target.value)}
-              placeholder="Master-Passwort"
-              onKeyPress={(e) => e.key === 'Enter' && handleUnlock()}
-              className="w-full p-3 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500 shadow-md"
-              autoComplete="off"
-            />
-            {error && <p className="text-red-500 text-center text-sm">{error}</p>}
-            
-            <button
-              onClick={handleUnlock}
-              className="w-full py-3 bg-blue-600 text-white font-bold text-lg rounded-xl shadow-lg shadow-blue-500/50 hover:bg-blue-700 transition duration-300"
-            >
-              Vault entsperren
-            </button>
-          </div>
-          <p className="text-xs text-center text-gray-400 mt-6">
-            Ihr Master-Passwort wird nur zur Entschlüsselung verwendet und nicht gespeichert.
-          </p>
-          <p className="text-xs text-center text-gray-400 mt-2">
-            Ihre Benutzer-ID (für private Daten): 
-            <span className="font-mono text-gray-600 break-all ml-1">{userId || 'Gast'}</span>
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  // UI für entsperrten Vault
-  return (
-    <div className="min-h-screen bg-gray-50 p-4 sm:p-8 font-sans">
-      <header className="flex flex-col sm:flex-row justify-between items-center mb-6 sticky top-0 bg-gray-50 pt-4 pb-4 z-40 shadow-sm border-b border-gray-200">
-        <div className="mb-4 sm:mb-0">
-          <h1 className="text-3xl font-extrabold text-gray-800">
-            <span className="text-blue-600">Secure</span> Vault
-          </h1>
-          <p className="text-sm text-gray-500">Ihre {vault.length} gespeicherten Zugänge</p>
-        </div>
-        <div className="flex flex-wrap gap-3 w-full sm:w-auto">
-          <input
-            type="text"
-            placeholder="Suchen nach Service/Nutzername..."
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            className="flex-1 min-w-[200px] p-2 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500 shadow-sm"
-          />
-          <button
-            onClick={() => { setCurrentEntry(null); setShowAddEditModal(true); }}
-            className="flex-shrink-0 px-4 py-2 bg-green-500 text-white font-semibold rounded-xl hover:bg-green-600 transition duration-300 shadow-md flex items-center justify-center"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-1" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M10 5a1 1 0 011 1v3h3a1 1 0 110 2h-3v3a1 1 0 11-2 0v-3H6a1 1 0 110-2h3V6a1 1 0 011-1z" clipRule="evenodd" />
-            </svg>
-            Neuer Eintrag
-          </button>
-          <button
-            onClick={() => { setMasterKey(null); setIsLocked(true); setVault([]); setError(''); }}
-            className="flex-shrink-0 px-4 py-2 bg-red-500 text-white font-semibold rounded-xl hover:bg-red-600 transition duration-300 shadow-md"
-            title="Vault sperren und Master-Passwort löschen"
-          >
-            Sperren
-          </button>
-        </div>
-      </header>
-
-      {error && (
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl relative mb-4" role="alert">
-          <strong className="font-bold">Fehler: </strong>
-          <span className="block sm:inline">{error}</span>
-        </div>
-      )}
-
-      {/* Vault List */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-        {filteredVault.length > 0 ? (
-          filteredVault.map(entry => (
-            <PasswordCard key={entry.id} entry={entry} />
-          ))
-        ) : (
-          <div className="md:col-span-2 lg:col-span-3 xl:col-span-4 bg-white p-10 rounded-2xl text-center text-gray-500 shadow-lg">
-            {filter ? (
-              <p className="text-xl font-medium">Keine Einträge gefunden, die "<strong>{filter}</strong>" enthalten.</p>
-            ) : (
-              <p className="text-xl font-medium">Ihr Vault ist leer. Fügen Sie oben Ihren ersten Eintrag hinzu!</p>
-            )}
-            
-          </div>
-        )}
-      </div>
-
-      <AddEditModal
-        isOpen={showAddEditModal}
-        onClose={() => { setShowAddEditModal(false); setCurrentEntry(null); }}
-        onSave={handleSaveEntry}
-        entry={currentEntry}
-      />
-    </div>
-  );
 };
 
-export default App;
 
-// Setzt den Log-Level für Firestore, falls verfügbar
-if (typeof setLogLevel !== 'undefined') {
-    setLogLevel('Debug');
-}
+/**
+ * Hauptkomponente des Vault-Managers.
+ */
+const VaultManager = () => {
+    const [isAuthenticated, setIsAuthenticated] = useState(false);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    
+    // Vault-Zustand
+    const [isLocked, setIsLocked] = useState(true);
+    const [vaultEntries, setVaultEntries] = useState([]);
+    const [decryptedKey, setDecryptedKey] = useState(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [unlockError, setUnlockError] = useState('');
+
+    // UI-Zustand
+    const [filter, setFilter] = useState('');
+    const [showAddEditModal, setShowAddEditModal] = useState(false);
+    const [currentEntry, setCurrentEntry] = useState(null);
+    const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+    const [entryToDelete, setEntryToDelete] = useState(null);
+
+
+    // --- Firebase Auth & Init ---
+    useEffect(() => {
+        if (!auth) return;
+
+        // 1. Authentifizierung mit Initial-Token oder anonym
+        const signIn = async () => {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Fehler bei der Firebase-Anmeldung:", error);
+            }
+        };
+
+        // 2. Auth State Listener
+        const unsubscribe = onAuthStateChanged(auth, (user) => {
+            if (user) {
+                setIsAuthenticated(true);
+                setUserId(user.uid);
+            } else {
+                setIsAuthenticated(false);
+                setUserId(null);
+            }
+            setIsAuthReady(true);
+        });
+
+        signIn();
+        return () => unsubscribe();
+    }, []);
+
+    // --- Firestore Data Listener ---
+    useEffect(() => {
+        if (!db || !userId || !isAuthReady) return;
+        
+        // Pfad: /artifacts/{appId}/users/{userId}/vault_entries
+        const collectionPath = `artifacts/${appId}/users/${userId}/vault_entries`;
+        const q = query(collection(db, collectionPath));
+        
+        // onSnapshot liefert Echtzeit-Updates
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const entries = [];
+            snapshot.forEach((doc) => {
+                entries.push({ id: doc.id, ...doc.data() });
+            });
+            // Sortiere nach Erstellungsdatum (wenn vorhanden)
+            entries.sort((a, b) => (b.createdAt?.toMillis() || 0) - (a.createdAt?.toMillis() || 0));
+            setVaultEntries(entries);
+        }, (error) => {
+            console.error("Fehler beim Abrufen der Vault-Einträge:", error);
+        });
+
+        return () => unsubscribe();
+    }, [db, userId, isAuthReady]);
+
+
+    // --- Vault-Logik ---
+
+    /**
+     * Entsperrt den Vault mit dem Master-Passwort.
+     * @param {string} masterPassword 
+     */
+    const handleUnlock = async (masterPassword) => {
+        if (!masterPassword) {
+            setUnlockError('Bitte Master-Passwort eingeben.');
+            return;
+        }
+
+        setIsLoading(true);
+        setUnlockError('');
+
+        try {
+            // 1. Schlüssel ableiten
+            const key = await getKeyFromMaster(masterPassword);
+            
+            // 2. Test-Entschlüsselung (optional, aber gut zur Validierung des Keys)
+            // Wenn es bereits Einträge gibt, versuche, den ersten zu entschlüsseln
+            if (vaultEntries.length > 0) {
+                const testEntry = vaultEntries[0];
+                const decryptedTest = await decrypt(testEntry.encryptedPassword, key);
+                
+                if (!decryptedTest) {
+                    // Entschlüsselung fehlgeschlagen -> falsches Passwort
+                    setUnlockError('Falsches Master-Passwort.');
+                    setIsLoading(false);
+                    return;
+                }
+            }
+
+            // 3. Vault entsperren
+            setDecryptedKey(key);
+            setIsLocked(false);
+            
+        } catch (e) {
+            console.error("Fehler beim Entsperren:", e);
+            setUnlockError('Ein unerwarteter Fehler ist aufgetreten.');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    /**
+     * Sperrt den Vault und löscht den Schlüssel aus dem Speicher.
+     */
+    const handleLock = () => {
+        setDecryptedKey(null);
+        setIsLocked(true);
+        setFilter('');
+        // Hinweis: Der Garbage Collector kümmert sich um den gelöschten CryptoKey
+    };
+    
+    /**
+     * Verarbeitet das Speichern eines neuen oder bearbeiteten Eintrags.
+     */
+    const handleSaveEntry = async (data, oldEntry) => {
+        if (!decryptedKey || !userId) return;
+
+        setIsLoading(true);
+        try {
+            const collectionRef = collection(db, `artifacts/${appId}/users/${userId}/vault_entries`);
+            
+            let encryptedUsername = oldEntry?.encryptedUsername;
+            let encryptedPassword = oldEntry?.encryptedPassword;
+
+            // Verschlüssle nur, wenn der Benutzername/Passwort neu eingegeben wurde
+            if (data.username) {
+                encryptedUsername = await encrypt(data.username, decryptedKey);
+            }
+            if (data.password) {
+                encryptedPassword = await encrypt(data.password, decryptedKey);
+            }
+
+            const entryData = {
+                serviceName: data.serviceName,
+                url: data.url || '',
+                encryptedUsername,
+                encryptedPassword,
+                updatedAt: serverTimestamp(),
+            };
+
+            if (data.id) {
+                // Eintrag bearbeiten
+                const docRef = doc(db, collectionRef, data.id);
+                await updateDoc(docRef, entryData);
+            } else {
+                // Neuen Eintrag hinzufügen
+                await addDoc(collectionRef, {
+                    ...entryData,
+                    createdAt: serverTimestamp(),
+                });
+            }
+
+        } catch (e) {
+            console.error("Fehler beim Speichern des Eintrags:", e);
+            alert("Fehler beim Speichern. Bitte Konsole prüfen."); // Ersatz für alert
+        } finally {
+            setIsLoading(false);
+            setCurrentEntry(null);
+        }
+    };
+
+    /**
+     * Löscht einen Eintrag.
+     */
+    const handleDeleteEntry = async (id) => {
+        if (!userId) return;
+
+        setIsLoading(true);
+        try {
+            const docRef = doc(db, `artifacts/${appId}/users/${userId}/vault_entries`, id);
+            await deleteDoc(docRef);
+        } catch (e) {
+            console.error("Fehler beim Löschen des Eintrags:", e);
+            alert("Fehler beim Löschen. Bitte Konsole prüfen."); // Ersatz für alert
+        } finally {
+            setIsLoading(false);
+        }
+    };
+    
+    // --- UI-Helfer ---
+    
+    const requestEdit = useCallback((entry) => {
+        setCurrentEntry(entry);
+        setShowAddEditModal(true);
+    }, []);
+
+    const requestDelete = useCallback((entry) => {
+        setEntryToDelete(entry);
+        setShowDeleteConfirm(true);
+    }, []);
+
+
+    // Filtert die Einträge basierend auf dem Suchstring
+    const filteredVault = useMemo(() => {
+        if (!filter) return vaultEntries;
+        const lowerCaseFilter = filter.toLowerCase();
+        
+        // Wir können nur nach nicht-verschlüsselten Feldern filtern, also nur den Dienstnamen und die URL.
+        // Für eine vollständige Suche müsste die Entschlüsselung im Hintergrund laufen, was aber
+        // einen sehr hohen Rechenaufwand bedeuten würde.
+        return vaultEntries.filter(entry => 
+            entry.serviceName.toLowerCase().includes(lowerCaseFilter) ||
+            entry.url.toLowerCase().includes(lowerCaseFilter)
+        );
+    }, [vaultEntries, filter]);
+
+    // --- Render-Logik ---
+
+    if (!isAuthReady) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-50 p-4">
+                <div className="bg-white p-10 rounded-2xl text-center text-gray-500 shadow-lg">
+                    <Settings className="w-10 h-10 mx-auto animate-spin text-blue-500 mb-4" />
+                    <p className="text-xl font-medium">Lade Anwendung und Authentifizierung...</p>
+                </div>
+            </div>
+        );
+    }
+    
+    if (isLocked) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-gray-100 p-4">
+                <div className="bg-white p-8 md:p-12 rounded-2xl shadow-2xl w-full max-w-md text-center">
+                    <Lock className="w-12 h-12 mx-auto text-blue-600 mb-4" />
+                    <h1 className="text-2xl font-bold text-gray-800 mb-6">Vault gesperrt</h1>
+                    
+                    <form onSubmit={(e) => { e.preventDefault(); handleUnlock(e.target.masterPassword.value); }} className="space-y-4">
+                        <div className="relative">
+                            <input
+                                id="masterPassword"
+                                name="masterPassword"
+                                type="password"
+                                placeholder="Master-Passwort"
+                                className="w-full p-3 border-2 border-gray-300 rounded-xl focus:border-blue-500 pr-10"
+                                required
+                                disabled={isLoading}
+                            />
+                            <ShieldCheck className="w-5 h-5 absolute right-3 top-3.5 text-gray-400" />
+                        </div>
+                        
+                        {unlockError && (
+                            <p className="text-red-500 text-sm font-medium">{unlockError}</p>
+                        )}
+
+                        <button
+                            type="submit"
+                            className="w-full bg-blue-600 text-white p-3 rounded-xl font-semibold hover:bg-blue-700 transition-colors flex items-center justify-center disabled:opacity-50"
+                            disabled={isLoading}
+                        >
+                            {isLoading ? (
+                                <Settings className="w-5 h-5 animate-spin mr-2" />
+                            ) : (
+                                <Unlock className="w-5 h-5 mr-2" />
+                            )}
+                            Vault entsperren
+                        </button>
+                    </form>
+                    
+                    <p className="mt-6 text-xs text-gray-400">Aktuelle User ID: {userId}</p>
+                </div>
+            </div>
+        );
+    }
+
+    // Entsperrter Zustand
+    return (
+        <div className="min-h-screen bg-gray-100 p-4 sm:p-6 md:p-8 font-sans">
+            <header className="flex flex-col md:flex-row justify-between items-center mb-6 p-4 bg-white rounded-xl shadow-md">
+                <h1 className="text-3xl font-extrabold text-gray-900 flex items-center mb-4 md:mb-0">
+                    <ShieldCheck className="w-8 h-8 text-blue-600 mr-3" />
+                    Mein Krypto-Vault
+                </h1>
+                
+                <div className="flex items-center space-x-3 w-full md:w-auto">
+                    <button 
+                        onClick={() => setShowAddEditModal(true)} 
+                        className="flex items-center bg-green-600 text-white p-3 rounded-xl font-semibold hover:bg-green-700 transition-colors text-sm shadow-lg"
+                        title="Neuen Eintrag hinzufügen"
+                    >
+                        <Plus className="w-4 h-4 mr-2" /> Eintrag
+                    </button>
+                    <button 
+                        onClick={handleLock} 
+                        className="p-3 bg-red-500 text-white rounded-xl hover:bg-red-600 transition-colors shadow-lg"
+                        title="Vault sperren"
+                    >
+                        <Lock className="w-5 h-5" />
+                    </button>
+                    <button 
+                        onClick={() => signOut(auth)} 
+                        className="p-3 bg-gray-300 text-gray-800 rounded-xl hover:bg-gray-400 transition-colors shadow-lg"
+                        title="Abmelden"
+                    >
+                        <LogOut className="w-5 h-5" />
+                    </button>
+                </div>
+            </header>
+
+            <div className="mb-6">
+                <div className="relative">
+                    <Search className="w-5 h-5 text-gray-400 absolute left-3 top-1/2 transform -translate-y-1/2" />
+                    <input
+                        type="text"
+                        placeholder="Einträge nach Dienstnamen oder URL filtern..."
+                        value={filter}
+                        onChange={(e) => setFilter(e.target.value)}
+                        className="w-full p-3 pl-10 border border-gray-300 rounded-xl focus:ring-blue-500 focus:border-blue-500 shadow-sm"
+                    />
+                </div>
+            </div>
+
+            {/* Raster der Passwort-Karten */}
+            <div className={`grid gap-6 ${filteredVault.length > 0 ? 'grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4' : ''}`}>
+                {isLoading ? (
+                    <div className="md:col-span-2 lg:col-span-3 xl:col-span-4 bg-white p-10 rounded-2xl text-center text-gray-500 shadow-lg">
+                        <Settings className="w-10 h-10 mx-auto animate-spin text-blue-500 mb-4" />
+                        <p className="text-xl font-medium">Lade Vault-Daten...</p>
+                    </div>
+                ) : filteredVault.length > 0 ? (
+                    filteredVault.map(entry => (
+                        <PasswordCard 
+                            key={entry.id} 
+                            entry={entry} 
+                            decryptedKey={decryptedKey} // Schlüssel für die Entschlüsselung bereitstellen
+                            onEdit={requestEdit} 
+                            onRequestDelete={requestDelete} 
+                        />
+                    ))
+                ) : (
+                    <div className="md:col-span-2 lg:col-span-3 xl:col-span-4 bg-white p-10 rounded-2xl text-center text-gray-500 shadow-lg">
+                        {filter ? (
+                            <p className="text-xl font-medium">Keine Einträge gefunden, die "<strong>{filter}</strong>" enthalten.</p>
+                        ) : (
+                            <p className="text-xl font-medium">Dieses Konto ist leer. Fügen Sie oben Ihren ersten Eintrag hinzu!</p>
+                        )}
+                        
+                    </div>
+                )}
+            </div>
+
+            {/* Modals für den entsperrten Zustand */}
+            <AddEditModal
+                isOpen={showAddEditModal}
+                onClose={() => { setShowAddEditModal(false); setCurrentEntry(null); }}
+                onSave={handleSaveEntry}
+                entry={currentEntry}
+                isLoading={isLoading}
+            />
+            
+            <DeleteConfirmationModal
+                isOpen={showDeleteConfirm}
+                onClose={() => setShowDeleteConfirm(false)}
+                entry={entryToDelete}
+                onConfirm={handleDeleteEntry}
+            />
+        </div>
+    );
+};
+
+export default VaultManager;
