@@ -27,15 +27,19 @@ python main.py
 
 ## Befehle
 
-1. Passwort hinzufügen
-2. Alle Passwörter anzeigen
-3. Passwort suchen
-4. Passwort-Details anzeigen
-5. Passwort aktualisieren
-6. Passwort löschen
-7. Favorit umschalten
-8. Statistiken anzeigen
-q. Beenden
+| Befehl | Beschreibung |
+|--------|-------------|
+| `hilfe`, `?`, `help`, `h` | Diese Hilfe anzeigen |
+| `add`, `neu` | Neuen Passwort-Eintrag hinzufügen |
+| `list`, `ls`, `liste` | Alle Passwörter anzeigen |
+| `search`, `suchen` | Passwörter durchsuchen |
+| `details`, `show` | Passwort-Details anzeigen |
+| `edit`, `bearbeiten` | Passwort bearbeiten |
+| `delete`, `loeschen` | Passwort löschen |
+| `favorit`, `fav` | Favorit umschalten |
+| `stats`, `statistik` | Statistiken anzeigen |
+| `clear`, `cls` | Bildschirm löschen |
+| `exit`, `quit`, `x` | Beenden |
 
 ## Sicherheit
 
@@ -46,7 +50,7 @@ q. Beenden
 
 ## Dateien
 
-- `main.py` - Hauptanwendung mit CLI-Interface
+- `main.py` - Hauptanwendung mit GUI-Interface
 - `database.py` - Datenbank-Verwaltung
 - `encryption.py` - Verschlüsselungs-Funktionen
 - `passwords.db` - SQLite-Datenbank (wird automatisch erstellt)
