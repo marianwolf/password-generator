@@ -1,0 +1,79 @@
+# ============================================
+# Password Vault - Docker Compose Configuration
+# ============================================
+# Production-ready configuration with all services
+
+services:
+  # Backend API Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: password-vault-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-jwt-secret-key}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-your-encryption-key}
+      - DATABASE_PATH=/app/data/vault.db
+      - LOG_LEVEL=INFO
+    volumes:
+      - vault_data:/app/data
+      - logs:/app/logs
+    depends_on:
+      - db
+    networks:
+      - vault-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    user: "1000:1000"
+
+  # Frontend Web Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: password-vault-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - vault-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Database Service (SQLite for simple deployment)
+  db:
+    image: alpine:latest
+    container_name: password-vault-db
+    restart: unless-stopped
+    volumes:
+      - vault_data:/data
+    networks:
+      - vault-network
+    user: "1000:1000"
+    command: ["sh", "-c", "mkdir -p /data && chown -R 1000:1000 /data"]
+
+# Named volumes for persistent data
+volumes:
+  vault_data:
+    driver: local
+  logs:
+    driver: local
+
+# Custom network for service isolation
+networks:
+  vault-network:
+    driver: bridge
