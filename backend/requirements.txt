@@ -1,28 +1,29 @@
 # ============================================
 # Password Vault - Python Dependencies
 # ============================================
+# Updated: 2024-XX-XX
 
 # Web Framework
-Flask==3.0.0
+Flask==3.0.3
 Flask-RESTful==0.3.10
-flask-cors==4.0.0
+flask-cors==4.0.1
 
 # Database
-SQLAlchemy==2.0.23
+SQLAlchemy==2.0.25
 Flask-SQLAlchemy==3.1.1
-SQLAlchemy-Utils==0.41.1
+SQLAlchemy-Utils==0.41.2
 
-# Authentication & Security
-PyJWT==2.8.0
+Flask-JWT-Extended==4.6.0
+PyJWT==2.9.0
 bcrypt==4.1.2
 passlib==1.7.4
-python-dotenv==1.0.0
+python-dotenv==1.0.1
 
 # Encryption
-cryptography==41.0.7
+cryptography==43.0.1
 
 # Password Validation & Generation
-zxcvbn==2.2
+zxcvbn>=4.4.25
 
 # Validation
 marshmallow==3.20.1
@@ -32,13 +33,13 @@ email-validator==2.1.0
 structlog==23.2.0
 
 # Testing
-pytest==7.4.3
+pytest==7.4.4
 pytest-flask==1.3.0
 pytest-cov==4.1.0
 factory-boy==3.3.0
 
 # Production Server
-gunicorn==21.2.0
+gunicorn==22.0.0
 gevent==23.9.1
 
 # Utilities

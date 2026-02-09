@@ -8,19 +8,79 @@ import os
 import logging
 import secrets
 import string
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from typing import Any, Optional
 from flask import Flask, request, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, verify_jwt_in_request
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.security import secure_filename
+from werkzeug.utils import secure_filename
 from cryptography.fernet import Fernet
 from marshmallow import Schema, fields, validate, ValidationError
 from sqlalchemy import event, desc
 from sqlalchemy.engine import Engine
 from sqlite3 import DatabaseError
+
+# Import Vault for secure configuration management
+from vault import Vault, VaultNotInitializedError, VaultAccessError
+
+
+# ============================================
+# Auto-generate .env file on first start
+# ============================================
+def generate_env_file():
+    """Generate .env file from .env.example with secure keys if it doesn't exist."""
+    env_example_path = Path(__file__).parent.parent / '.env.example'
+    env_path = Path(__file__).parent.parent / '.env'
+    
+    # Skip if .env already exists
+    if env_path.exists():
+        print(".env file already exists, skipping generation")
+        return
+    
+    # Check if .env.example exists
+    if not env_example_path.exists():
+        print(".env.example not found, cannot generate .env")
+        return
+    
+    # Read .env.example template
+    try:
+        with open(env_example_path, 'r', encoding='utf-8') as f:
+            env_content = f.read()
+    except Exception as e:
+        print(f"Failed to read .env.example: {e}")
+        return
+    
+    # Generate secure keys
+    secret_key = secrets.token_hex(256)
+    jwt_secret_key = secrets.token_hex(256)
+    encryption_key = Fernet.generate_key().decode()
+    
+    # Replace placeholders in template
+    replacements = {
+        'your-secure-random-string-min-32-characters-long': secret_key,
+        'your-jwt-secret-key-at-least-32-characters': jwt_secret_key,
+        'your-encryption-key-32-chars-base64-encoded': encryption_key
+    }
+    
+    new_env_content = env_content
+    for placeholder, value in replacements.items():
+        new_env_content = new_env_content.replace(placeholder, value)
+    
+    # Write new .env file
+    try:
+        with open(env_path, 'w', encoding='utf-8') as f:
+            f.write(new_env_content)
+        print(f".env file generated successfully with secure keys at {env_path}")
+    except Exception as e:
+        print(f"Failed to write .env file: {e}")
+
+
+# Generate .env file if it doesn't exist
+generate_env_file()
 
 # Configure logging
 logging.basicConfig(
@@ -28,20 +88,53 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('/app/logs/vault.log')
+        logging.FileHandler('logs/vault.log')
     ]
 )
 logger = logging.getLogger(__name__)
 
+# Initialize Vault FIRST - before Flask app
+# This ensures all secrets are loaded from the encrypted vault
+try:
+    vault = Vault(auto_initialize=False)
+    
+    # Check if vault exists, if not create one
+    vault_file = Path(__file__).parent / 'data' / 'vault.enc'
+    if vault_file.exists():
+        # Unlock existing vault
+        vault.unlock()
+    else:
+        # Create new vault with auto-generated secure password
+        # In production, this should be prompted interactively or set via VAULT_MASTER_PASSWORD
+        vault._create_vault(os.environ.get('VAULT_MASTER_PASSWORD'))
+    
+    # Migrate .env to vault
+    vault._migrate_env_files()
+    
+    logger.info("Vault initialized successfully")
+except (VaultNotInitializedError, VaultAccessError) as e:
+    logger.error(f"Failed to initialize vault: {e}")
+    logger.warning("Falling back to environment variables. Set VAULT_MASTER_PASSWORD for secure mode.")
+    vault = None
+
 # Initialize Flask app
 app = Flask(__name__)
 
-# Configuration
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', secrets.token_hex(32))
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)
-app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=7)
-app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.environ.get('DATABASE_PATH', '/app/data/vault.db')}"
+# Get configuration from Vault or fallback to environment variables
+def get_config(key: str, default: str | None = None) -> str | None:
+    """Get configuration from vault or environment."""
+    if vault and vault.is_unlocked:
+        value = vault.get(key)
+        if value is not None:
+            return value
+    return os.environ.get(key, default)
+
+# Configuration - Load from Vault if available, else from environment
+app.config['SECRET_KEY'] = get_config('SECRET_KEY', secrets.token_hex(32))
+app.config['JWT_SECRET_KEY'] = get_config('JWT_SECRET_KEY', secrets.token_hex(32))
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=int(get_config('JWT_ACCESS_TOKEN_EXPIRES_HOURS', '1') or '1'))
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=int(get_config('JWT_REFRESH_TOKEN_EXPIRES_DAYS', '7') or '7'))
+app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{get_config('DATABASE_PATH', 'data/vault.db')}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
@@ -51,7 +144,7 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 # Enable CORS
 CORS(app, resources={
     r"/api/*": {
-        "origins": os.environ.get('ALLOWED_ORIGINS', '*').split(','),
+        "origins": (get_config('ALLOWED_ORIGINS', '*') or '*').split(','),
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -61,9 +154,15 @@ CORS(app, resources={
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# Initialize encryption
+# Initialize encryption - get key from Vault or generate fallback
 def get_encryption_key():
-    """Retrieve or generate encryption key."""
+    """Retrieve encryption key from vault or environment."""
+    if vault and vault.is_unlocked:
+        key = vault.get('ENCRYPTION_KEY')
+        if key:
+            return key
+    
+    # Fallback to environment
     key = os.environ.get('ENCRYPTION_KEY')
     if not key:
         logger.warning("No ENCRYPTION_KEY set, using generated key (not recommended for production)")
@@ -246,6 +345,44 @@ class AuditLog(db.Model):
         }
 
 # ============================================
+# TypedDict for Schema Data (for Pylance type checking)
+# ============================================
+from typing import TypedDict
+
+class UserRegistrationData(TypedDict):
+    email: str
+    password: str
+    master_password: str
+
+class UserLoginData(TypedDict):
+    email: str
+    password: str
+
+class PasswordEntryData(TypedDict, total=False):
+    title: str
+    username: str | None
+    password: str
+    website_url: str | None
+    notes: str | None
+    category: str
+    is_favorite: bool
+    expiry_date: datetime | None
+
+class PasswordUpdateData(TypedDict, total=False):
+    title: str
+    username: str | None
+    password: str
+    website_url: str | None
+    notes: str | None
+    category: str
+    is_favorite: bool
+    expiry_date: datetime | None
+
+class ExportImportData(TypedDict):
+    format: str
+    password: str
+
+# ============================================
 # Marshmallow Schemas
 # ============================================
 class UserRegistrationSchema(Schema):
@@ -322,7 +459,7 @@ def generate_strong_password(length=16, use_uppercase=True, use_numbers=True, us
 
 def log_audit_action(user_id, action, resource_type=None, resource_id=None, details=None):
     """Log an audit action."""
-    log = AuditLog(
+    log = AuditLog(  # type: ignore[arg-type]
         user_id=user_id,
         action=action,
         resource_type=resource_type,
@@ -505,7 +642,10 @@ def refresh_token():
     from jwt import ExpiredSignatureError, InvalidTokenError
     
     try:
-        refresh_token_value = request.headers.get('Authorization').split()[1]
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Invalid authorization header'}), 401
+        refresh_token_value = auth_header.split()[1]
         decoded = decode_token(refresh_token_value)
         
         if decoded.get('type') != 'refresh':
@@ -836,7 +976,7 @@ def export_passwords():
     export_data = {
         'version': '1.0',
         'export_date': datetime.now(timezone.utc).isoformat(),
-        'user_email': User.query.get(current_user_id).email,
+        'user_email': User.query.get(current_user_id).email if User.query.get(current_user_id) else None,
         'entries': [entry.to_dict(include_password=True) for entry in passwords]
     }
     
